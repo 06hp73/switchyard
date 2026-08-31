@@ -41,6 +41,7 @@ demonstrably is not (Leßenich et al.).
 | `tools/train/setup_station.sh` | Creates the train's own full clone ("the station") — a separate clone, not a worktree, because the train must hold `main` at all times. |
 | `tools/lib/switchyard_config.py` | The project config layer: loads `switchyard.toml` (env var, repo-toplevel, or `~/.config/switchyard/`, in that order) into a `SwitchyardConfig`. Every field defaults to today's hardcoded behavior, so an absent file changes nothing; a broken one (malformed TOML, unknown key) warns on stderr and falls back to defaults rather than crashing. |
 | `tools/lib/config_get.sh` | Bash-side `sy_cfg <key> <default>` — lets the guards read one config value without paying a Python startup cost when no config file exists at all. |
+| `tools/cli.py`, `bin/switchyard` | The unified `switchyard` CLI: `status` (one composed, read-only view — WIP, radar, queue via `gh`, flaky log if present, last landings), `stats` (counts, landing rate, gate-time mean/p90, top rejected branches from `.train/history.jsonl`), and thin `radar`/`land` passthroughs to the modules above (every flag forwards verbatim, so behavior never drifts from calling those scripts directly). Every `status`/`stats` section degrades independently — a missing `gh`, an untrained repo, or a missing `.train/` file never takes the rest of the view down. |
 
 ## Wiring into a project (Claude Code)
 
@@ -55,13 +56,35 @@ demonstrably is not (Leßenich et al.).
 5. Land branches with
    `python3 tools/train/merge_train.py run --repo <station> [--branch NAME]`
    (default candidates: open non-draft PRs against `main`, priority-labeled
-   ones first, then oldest first by PR number).
+   ones first, then oldest first by PR number), or the equivalent
+   `bin/switchyard land --repo <station> [--branch NAME]` — every flag
+   forwards straight to `merge_train.py run`.
    Exit codes: 0 = nothing errored (rejected/conflict are normal outcomes),
    1 = dry-run found a branch that would not land, 2 = a system error.
 
 Convention that makes it all work: sessions open **draft** PRs while working
 and mark them **ready** to queue for the train; `main` is never pushed by
 anyone but the train.
+
+## The `switchyard` CLI
+
+`bin/switchyard` is a single entry point over the scripts above (add it to
+`PATH`, or call it by path). `SWITCHYARD_PYTHON` picks the interpreter
+(default `python3` — must resolve to 3.11+ for `switchyard.toml` support;
+every command still degrades gracefully, never crashes, on an older one).
+
+```bash
+bin/switchyard status --repo <station>   # one composed view: WIP, radar, queue, flaky, last landings
+bin/switchyard stats  --repo <station>   # .train/history.jsonl: counts, landing rate, gate-time mean/p90
+bin/switchyard radar  --repo <station>   # passthrough - identical to collision_radar.py's own flags
+bin/switchyard land   --repo <station>   # passthrough - identical to `merge_train.py run`'s own flags
+```
+
+`status` and `stats` are read-only and safe to run anytime, including
+against a repo that has never trained: each section (WIP/RADAR/QUEUE/FLAKY/
+LAST LANDINGS) reports its own "nothing here yet" line instead of failing
+the whole view when its data source (`gh`, `.train/history.jsonl`, ...) is
+absent.
 
 ## Configuration
 

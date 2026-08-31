@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec "${SWITCHYARD_PYTHON:-python3}" "$(dirname "$0")/../tools/cli.py" "$@"
