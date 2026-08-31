@@ -85,6 +85,11 @@ State (at the repo root):
                                   whose gate already passed
     .train/lock/                - mkdir-mutex (with pid file) so only one
                                   train runs; stale locks are reclaimed
+    .train/history.jsonl        - one JSON line per branch result (branch,
+                                  status, detail_first_line, gate_seconds,
+                                  tree, batch, ts) - see _append_history.
+                                  Best-effort: a write failure never affects
+                                  the TrainResult it was trying to log.
 
 Usage:
     python tools/train/merge_train.py run [--repo PATH] [--branch NAME ...]
@@ -113,6 +118,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -127,8 +133,15 @@ class TrainResult:
     branch: str
     status: str  # landed | rejected | conflict | error
     detail: str = ""
+    # Landing-history metadata (see _append_history) - informational, not
+    # identity, same as `detail`: every existing TrainResult(branch, status)
+    # / TrainResult(branch, status, detail) call site keeps working unchanged.
+    gate_seconds: float = 0.0  # 0.0 when no gate ran at all (cache hit, or
+    # rejected/error before a candidate tree ever existed)
+    tree: str = ""  # candidate tree hash this result was decided against, "" if none
+    batch_size: int = 1  # size of the candidate group this result was decided within
 
-    def __eq__(self, other):  # detail is informational, not identity
+    def __eq__(self, other):  # detail/history fields are informational, not identity
         return (
             isinstance(other, TrainResult)
             and self.branch == other.branch
@@ -386,26 +399,31 @@ def _land_via_pr_squash(
 
 def _run_gate(
     repo: Path, gate: list[str], gate_timeout: int, dry_run: bool, key: str
-) -> str | None:
+) -> tuple[str | None, float]:
     """Run `gate` in `repo`, honoring the validated-tree cache.
 
     Shared by the single-branch path and the batch path so the two can never
-    drift apart on cache/timeout/kill-process-group semantics. Returns None
-    on green (the gate passed, or the tree+gate combination was already
-    cached) or a detail string describing why it is red (a timeout or the
-    gate's own failure tail) - the caller decides what "red" means for it
-    (reject one branch, or bisect a batch).
+    drift apart on cache/timeout/kill-process-group semantics. Returns
+    (detail, elapsed_seconds). `detail` is None on green (the gate passed, or
+    the tree+gate combination was already cached) or a string describing why
+    it is red (a timeout or the gate's own failure tail) - the caller decides
+    what "red" means for it (reject one branch, or bisect a batch).
+    `elapsed_seconds` is exactly 0.0 when the cache was hit (no process ever
+    started) and the real wall-clock duration of the gate subprocess
+    otherwise - including on timeout or failure - so the landing-history log
+    (see _append_history) can tell a genuinely fast gate from a cache hit.
 
     Dry-run neither reads nor writes the cache: a dry-run must never
     pre-approve a later real run, and must itself always exercise the gate.
     """
     if not dry_run and key in _validated_keys(repo):
-        return None
+        return None, 0.0
     # Popen + start_new_session (not subprocess.run's timeout=) so a
     # timeout can kill the WHOLE process group. A gate that shells out
     # (bash -> pytest) leaves the real work as a grandchild: killing only
     # the direct child on timeout lets it reparent to PID 1 and keep
     # burning the host while the train moves on.
+    start = time.perf_counter()
     gate_proc = subprocess.Popen(
         gate,
         cwd=repo,
@@ -422,13 +440,15 @@ def _run_gate(
         except ProcessLookupError:
             pass  # already exited between the timeout and the kill
         gate_proc.communicate()  # reap, discard output
-        return f"gate timed out after {gate_timeout}s (process group killed)"
+        elapsed = time.perf_counter() - start
+        return f"gate timed out after {gate_timeout}s (process group killed)", elapsed
+    elapsed = time.perf_counter() - start
     if gate_proc.returncode != 0:
         tail = (gate_out + gate_err)[-2000:]
-        return f"gate failed:\n{tail}"
+        return f"gate failed:\n{tail}", elapsed
     if not dry_run:
         _record_key(repo, key)
-    return None
+    return None, elapsed
 
 
 def process_branch(
@@ -477,23 +497,26 @@ def process_branch(
     tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
 
     key = _cache_key(tree, gate)
-    gate_detail = _run_gate(repo, gate, gate_timeout, dry_run, key)
+    gate_detail, gate_seconds = _run_gate(repo, gate, gate_timeout, dry_run, key)
     if gate_detail is not None:
         _git(repo, "reset", "--hard", f"origin/{protected}")
-        return TrainResult(branch, "rejected", gate_detail)
+        return TrainResult(branch, "rejected", gate_detail, gate_seconds, tree)
 
     if dry_run:
         _git(repo, "reset", "--hard", f"origin/{protected}")
-        return TrainResult(branch, "landed", "dry-run: validated, not pushed")
+        return TrainResult(branch, "landed", "dry-run: validated, not pushed", gate_seconds, tree)
 
     if land == "pr-squash":
-        return _land_via_pr_squash(repo, branch, tree, head_sha, protected)
+        result = _land_via_pr_squash(repo, branch, tree, head_sha, protected)
+        return dataclasses.replace(result, gate_seconds=gate_seconds, tree=tree)
 
     push = _git(repo, "push", "origin", protected, check=False)
     if push.returncode != 0:
         _git(repo, "reset", "--hard", f"origin/{protected}")
-        return TrainResult(branch, "error", f"push failed: {push.stderr.strip()[:400]}")
-    return TrainResult(branch, "landed")
+        return TrainResult(
+            branch, "error", f"push failed: {push.stderr.strip()[:400]}", gate_seconds, tree
+        )
+    return TrainResult(branch, "landed", "", gate_seconds, tree)
 
 
 # --- Batch mode (--batch N) -------------------------------------------------
@@ -681,21 +704,30 @@ def _run_batch(
     _git(repo, "reset", "--hard", f"origin/{protected}")
 
     built, set_aside, head_shas = _build_candidate_group(repo, group, protected)
+    group_size = len(group)
+    set_aside = [dataclasses.replace(r, batch_size=group_size) for r in set_aside]
     if not built:
         return set_aside
 
     tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
     key = _cache_key(tree, gate)
-    gate_detail = _run_gate(repo, gate, gate_timeout, dry_run, key)
+    gate_detail, gate_seconds = _run_gate(repo, gate, gate_timeout, dry_run, key)
 
     if gate_detail is None:
-        return set_aside + _land_batch(repo, built, tree, head_shas, land, dry_run, protected)
+        landed = _land_batch(repo, built, tree, head_shas, land, dry_run, protected)
+        landed = [
+            dataclasses.replace(r, gate_seconds=gate_seconds, tree=tree, batch_size=group_size)
+            for r in landed
+        ]
+        return set_aside + landed
 
     # Red. A lone member is a normal rejection, not a further split - halving
     # a size-1 list forever would never terminate.
     if len(built) == 1:
         _git(repo, "reset", "--hard", f"origin/{protected}")
-        return set_aside + [TrainResult(built[0], "rejected", gate_detail)]
+        return set_aside + [
+            TrainResult(built[0], "rejected", gate_detail, gate_seconds, tree, group_size)
+        ]
 
     mid = len(built) // 2
     left_results = _run_batch(repo, built[:mid], gate, dry_run, gate_timeout, land, protected)
@@ -708,6 +740,35 @@ def _log_result(result: TrainResult) -> None:
         f"train: {result.branch} -> {result.status}"
         + (f" ({result.detail.splitlines()[0][:120]})" if result.detail else "")
     )
+
+
+def _append_history(repo: Path, result: TrainResult) -> None:
+    """Best-effort append of one landing-history line to .train/history.jsonl.
+
+    One JSON object per branch result, written right after run_train
+    finalizes it: {branch, status, detail_first_line, gate_seconds, tree,
+    batch, ts}. This is a durable record for `switchyard status`/`switchyard
+    stats` to read later - it never feeds back into any landing decision, so
+    a write failure (full disk, .train removed mid-run, a directory sitting
+    where the file should be, ...) is swallowed with one warning, exactly
+    like the gate-cache read/write path above: history-writing must never
+    change or block a TrainResult.
+    """
+    entry = {
+        "branch": result.branch,
+        "status": result.status,
+        "detail_first_line": result.detail.splitlines()[0] if result.detail else "",
+        "gate_seconds": round(result.gate_seconds, 3),
+        "tree": result.tree,
+        "batch": result.batch_size,
+        "ts": time.time(),
+    }
+    try:
+        state = _state_dir(repo)
+        with open(state / "history.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as exc:
+        print(f"train: could not write landing history ({exc})")
 
 
 def run_train(
@@ -744,6 +805,7 @@ def run_train(
                     _git(repo, "reset", "--hard", f"origin/{protected}", check=False)
                 results.append(result)
                 _log_result(result)
+                _append_history(repo, result)
         else:
             # gate_factory is inherently per-branch; a batch gates ONE
             # candidate tree for several branches at once, so there is no
@@ -759,7 +821,9 @@ def run_train(
                     )
                 except Exception as exc:  # noqa: BLE001 - one broken group must not stall the queue
                     detail = f"{type(exc).__name__}: {exc}"
-                    group_results = [TrainResult(b, "error", detail) for b in group]
+                    group_results = [
+                        TrainResult(b, "error", detail, batch_size=len(group)) for b in group
+                    ]
                     _git(repo, "reset", "--hard", f"origin/{protected}", check=False)
                 # _run_batch's internal set-aside/bisect order does not track
                 # queue order - re-sort into it here so the caller always
@@ -770,6 +834,7 @@ def run_train(
                     result = by_branch[branch]
                     results.append(result)
                     _log_result(result)
+                    _append_history(repo, result)
     finally:
         shutil.rmtree(lock, ignore_errors=True)
     counts: dict[str, int] = {}

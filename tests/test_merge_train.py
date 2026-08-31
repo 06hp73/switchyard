@@ -736,3 +736,57 @@ def test_train_respects_config_gate_fast_and_batch_via_switchyard_toml(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert git(origin, "show", "main:good.txt") == "good change"
     assert git(origin, "show", "main:bad.txt") == "bad change"
+
+
+# --- landing history (.train/history.jsonl) ---------------------------------
+
+
+def test_history_appends_line_on_green_land(tmp_path):
+    origin, station = make_world(tmp_path)
+    results = run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"])
+    assert results[0].status == "landed"
+
+    history = station / ".train" / "history.jsonl"
+    lines = history.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["branch"] == "claude/good"
+    assert entry["status"] == "landed"
+    assert entry["gate_seconds"] > 0.0
+    assert entry["tree"]  # non-empty candidate tree hash
+    assert entry["batch"] == 1
+    assert isinstance(entry["ts"], float)
+    assert entry["detail_first_line"] == ""
+
+
+def test_history_cache_hit_records_zero_gate_seconds(tmp_path):
+    origin, station = make_world(tmp_path)
+    gate = ["/usr/bin/true"]
+    run_train(repo=station, branches=["claude/good"], gate=gate)
+    # Re-run the identical already-landed branch against the same gate: the
+    # merge is a no-op (already up to date) so the candidate tree - and hence
+    # the cache key - is unchanged, and the gate must not actually run again.
+    run_train(repo=station, branches=["claude/good"], gate=gate)
+
+    history = station / ".train" / "history.jsonl"
+    entries = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == 2
+    assert entries[0]["gate_seconds"] > 0.0
+    assert entries[1]["gate_seconds"] == 0.0
+    assert entries[1]["status"] == "landed"
+
+
+def test_corrupt_history_dir_does_not_affect_results(tmp_path, capsys):
+    origin, station = make_world(tmp_path)
+    train_dir = station / ".train"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    # history.jsonl exists as a directory, not a file: open(..., "a") must
+    # raise OSError, and that must never surface as a broken landing.
+    (train_dir / "history.jsonl").mkdir()
+
+    results = run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"])
+
+    assert results == [TrainResult(branch="claude/good", status="landed")]
+    assert (train_dir / "history.jsonl").is_dir()  # untouched, still a directory
+    out = capsys.readouterr().out
+    assert "history" in out.lower()
