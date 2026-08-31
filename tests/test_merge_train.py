@@ -15,7 +15,9 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "train"))
-MERGE_TRAIN_SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "train" / "merge_train.py"
+MERGE_TRAIN_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "tools" / "train" / "merge_train.py"
+)
 
 from merge_train import TrainResult, _cache_key, run_train  # noqa: E402
 
@@ -30,7 +32,11 @@ ENV = {
 
 def git(cwd: Path, *args: str) -> str:
     proc = subprocess.run(
-        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True, env=ENV
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=ENV,
     )
     return proc.stdout.strip()
 
@@ -41,13 +47,19 @@ def make_world(tmp_path: Path) -> tuple[Path, Path]:
     git(origin, "init", "--bare", "-b", "main")
     seed = tmp_path / "seed"
     subprocess.run(
-        ["git", "clone", str(origin), str(seed)], check=True, capture_output=True, env=ENV
+        ["git", "clone", str(origin), str(seed)],
+        check=True,
+        capture_output=True,
+        env=ENV,
     )
     (seed / "app.txt").write_text("v1\n")
     git(seed, "add", "-A")
     git(seed, "commit", "-m", "base")
     git(seed, "push", "origin", "main")
-    for name, content in [("claude/good", "good change\n"), ("claude/bad", "bad change\n")]:
+    for name, content in [
+        ("claude/good", "good change\n"),
+        ("claude/bad", "bad change\n"),
+    ]:
         git(seed, "checkout", "-b", name, "main")
         (seed / f"{name.split('/')[1]}.txt").write_text(content)
         git(seed, "add", "-A")
@@ -56,7 +68,10 @@ def make_world(tmp_path: Path) -> tuple[Path, Path]:
         git(seed, "checkout", "main")
     station = tmp_path / "station"
     subprocess.run(
-        ["git", "clone", str(origin), str(station)], check=True, capture_output=True, env=ENV
+        ["git", "clone", str(origin), str(station)],
+        check=True,
+        capture_output=True,
+        env=ENV,
     )
     return origin, station
 
@@ -127,7 +142,9 @@ def test_cache_is_gate_specific(tmp_path):
     before = origin_main(origin)
     counter = tmp_path / "false_count"
     false_gate = ["/bin/sh", "-c", f"echo x >> {counter}; exit 1"]
-    run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"], dry_run=True)
+    run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], dry_run=True
+    )
     results = run_train(repo=station, branches=["claude/good"], gate=false_gate)
     assert results[0].status == "rejected"
     assert counter.exists() and len(counter.read_text().splitlines()) == 1
@@ -138,7 +155,10 @@ def test_gate_timeout_rejects(tmp_path):
     origin, station = make_world(tmp_path)
     before = origin_main(origin)
     results = run_train(
-        repo=station, branches=["claude/good"], gate=["/bin/sh", "-c", "sleep 3"], gate_timeout=1
+        repo=station,
+        branches=["claude/good"],
+        gate=["/bin/sh", "-c", "sleep 3"],
+        gate_timeout=1,
     )
     assert results[0].status == "rejected"
     assert "timed out" in results[0].detail
@@ -170,7 +190,9 @@ def test_missing_gate_binary_is_error_and_queue_continues(tmp_path):
         branches=["claude/bad", "claude/good"],
         gate=None,
         gate_factory=lambda branch: (
-            ["/nonexistent/gate-binary"] if branch == "claude/bad" else ["/usr/bin/true"]
+            ["/nonexistent/gate-binary"]
+            if branch == "claude/bad"
+            else ["/usr/bin/true"]
         ),
     )
     assert [r.status for r in results] == ["error", "landed"]
@@ -193,7 +215,9 @@ def test_gate_timeout_kills_process_tree(tmp_path):
     sleeper_pid_file = tmp_path / "sleeper_pid"
     gate = ["/bin/sh", "-c", f"(sleep 30 & echo $! > {sleeper_pid_file}; wait)"]
 
-    results = run_train(repo=station, branches=["claude/good"], gate=gate, gate_timeout=1)
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=gate, gate_timeout=1
+    )
 
     assert results[0].status == "rejected"
     assert origin_main(origin) == before
@@ -326,6 +350,78 @@ def write_fake_gh(tmp_path: Path) -> Path:
     return script
 
 
+FAKE_GH_MULTI_BODY = """# Stub `gh` for the batch pr-squash test - see write_fake_gh_multi() below.
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+
+def main():
+    args = sys.argv[1:]
+    argv_log = os.environ.get("FAKE_GH_ARGV_LOG")
+    if argv_log:
+        with open(argv_log, "a") as f:
+            f.write(json.dumps(args) + "\\n")
+    branch_prs = json.loads(os.environ["FAKE_GH_BRANCH_PRS"])  # {branch: pr_number}
+    pr_branches = {v: k for k, v in branch_prs.items()}
+    if args[:2] == ["pr", "list"]:
+        branch = args[args.index("--head") + 1]
+        pr_number = branch_prs.get(branch, "")
+        if pr_number:
+            print(pr_number)
+        return 0
+    if args[:2] == ["pr", "merge"]:
+        pr_number = args[2]
+        branch = pr_branches[pr_number]
+        origin_url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        clone = tempfile.mkdtemp(prefix="fake-gh-multi-clone-")
+        subprocess.run(["git", "clone", "-q", origin_url, clone], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", clone, "merge", "--squash", "origin/" + branch],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", clone, "commit", "-m", "squash merge " + branch],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", clone, "push", "-q", "origin", "main"], check=True, capture_output=True
+        )
+        return 0
+    sys.stderr.write("fake_gh_multi stub: unhandled args " + repr(args) + "\\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""
+
+
+def write_fake_gh_multi(tmp_path: Path) -> Path:
+    """Write the stub `gh` for the batch pr-squash test.
+
+    write_fake_gh's stub always operates on one hardcoded FAKE_GH_BRANCH, but
+    a batch lands several different branches through the same `gh` binary in
+    one run - this stub instead takes a real branch<->PR-number mapping
+    (FAKE_GH_BRANCH_PRS, a JSON object) so it can resolve which branch a
+    given `pr list --head <branch>` or `pr merge <number>` call is actually
+    about, the same way the real `gh` would via GitHub's own PR database.
+    """
+    script = tmp_path / "fake_gh_multi.py"
+    script.write_text("#!" + sys.executable + "\n" + FAKE_GH_MULTI_BODY)
+    script.chmod(0o755)
+    return script
+
+
 def test_pr_squash_lands_and_tree_matches(tmp_path, monkeypatch):
     origin, station = make_world(tmp_path)
     before = origin_main(origin)
@@ -355,7 +451,9 @@ def test_pr_squash_merge_rejected_leaves_main_unmoved(tmp_path, monkeypatch):
     monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
     monkeypatch.setenv("FAKE_GH_PR_NUMBER", "7")
     monkeypatch.setenv("FAKE_GH_MERGE_MODE", "fail")
-    monkeypatch.setenv("FAKE_GH_FAIL_MESSAGE", "required status checks have not been met")
+    monkeypatch.setenv(
+        "FAKE_GH_FAIL_MESSAGE", "required status checks have not been met"
+    )
 
     results = run_train(
         repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
@@ -468,3 +566,119 @@ def test_cli_dry_run_red_exits_1(tmp_path):
         text=True,
     )
     assert real_run.returncode == 0, real_run.stderr
+
+
+def test_batch_one_is_byte_equivalent_to_unbatched(tmp_path):
+    # Same scenario as test_green_branch_lands, with batch=1 spelled out
+    # explicitly: the batch parameter must not change the plain path at all.
+    origin, station = make_world(tmp_path)
+    before = origin_main(origin)
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], batch=1
+    )
+    assert results == [TrainResult(branch="claude/good", status="landed")]
+    assert origin_main(origin) != before
+
+
+def test_batch_green_lands_all_with_one_gate_run(tmp_path):
+    origin, station = make_world(tmp_path)
+    counter = tmp_path / "count"
+    gate = ["/bin/sh", "-c", f"echo x >> {counter}; exit 0"]
+
+    results = run_train(
+        repo=station, branches=["claude/good", "claude/bad"], gate=gate, batch=2
+    )
+
+    assert [r.status for r in results] == ["landed", "landed"]
+    assert len(counter.read_text().splitlines()) == 1
+    # Both branches' content changes really landed on origin/main, not just
+    # one of them or a tree that happens to satisfy the gate by luck.
+    assert git(origin, "show", "main:good.txt") == "good change"
+    assert git(origin, "show", "main:bad.txt") == "bad change"
+
+
+def test_batch_red_bisects_to_culprit(tmp_path):
+    origin, station = make_world(tmp_path)
+    counter = tmp_path / "count"
+    # Fails whenever claude/bad's file is present in the candidate tree -
+    # a stand-in for "this branch breaks the gate", independent of claude/good.
+    gate = [
+        "/bin/sh",
+        "-c",
+        f"echo x >> {counter}; test -f bad.txt && exit 1 || exit 0",
+    ]
+
+    results = run_train(
+        repo=station, branches=["claude/good", "claude/bad"], gate=gate, batch=2
+    )
+
+    assert [r.status for r in results] == ["landed", "rejected"]
+    # Three gate runs: the full pair (red), then each half alone (AB, A, B) -
+    # bisection, not a re-run of the same failing gate.
+    assert len(counter.read_text().splitlines()) == 3
+    assert git(origin, "show", "main:good.txt") == "good change"
+    with pytest.raises(subprocess.CalledProcessError):
+        git(origin, "show", "main:bad.txt")
+
+
+def test_batch_conflicting_member_set_aside(tmp_path):
+    origin, station = make_world(tmp_path)
+    seed = tmp_path / "seed"
+    git(seed, "checkout", "main")
+    git(seed, "checkout", "-b", "claude/collide", "main")
+    (seed / "good.txt").write_text("collide change\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "collide with claude/good's good.txt")
+    git(seed, "push", "origin", "claude/collide")
+    git(seed, "checkout", "main")
+
+    counter = tmp_path / "count"
+    gate = ["/bin/sh", "-c", f"echo x >> {counter}; exit 0"]
+
+    results = run_train(
+        repo=station, branches=["claude/good", "claude/collide"], gate=gate, batch=2
+    )
+
+    assert [r.status for r in results] == ["landed", "conflict"]
+    # The conflicting member never made it into the candidate, so it never
+    # cost a gate run of its own - one candidate (claude/good alone) built.
+    assert len(counter.read_text().splitlines()) == 1
+    assert git(origin, "show", "main:good.txt") == "good change"
+
+
+def test_batch_prsquash_final_tree_verified(tmp_path, monkeypatch):
+    origin, station = make_world(tmp_path)
+    fake_gh = write_fake_gh_multi(tmp_path)
+    argv_log = tmp_path / "argv.log"
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv(
+        "FAKE_GH_BRANCH_PRS", json.dumps({"claude/good": "1", "claude/bad": "2"})
+    )
+    monkeypatch.setenv("FAKE_GH_ARGV_LOG", str(argv_log))
+
+    results = run_train(
+        repo=station,
+        branches=["claude/good", "claude/bad"],
+        gate=["/usr/bin/true"],
+        land="pr-squash",
+        batch=2,
+    )
+
+    assert [r.status for r in results] == ["landed", "landed"]
+    # No mismatch error: origin/main's tree after both gh squashes lands
+    # really does equal the tree the train gated once, up front.
+    assert git(origin, "show", "main:good.txt") == "good change"
+    assert git(origin, "show", "main:bad.txt") == "bad change"
+
+    calls = [json.loads(line) for line in argv_log.read_text().splitlines()]
+    merge_calls = [c for c in calls if c[:2] == ["pr", "merge"]]
+    assert len(merge_calls) == 2
+    branch_head_sha = {
+        "claude/good": git(origin, "rev-parse", "claude/good"),
+        "claude/bad": git(origin, "rev-parse", "claude/bad"),
+    }
+    pr_to_branch = {"1": "claude/good", "2": "claude/bad"}
+    for call in merge_calls:
+        assert "--match-head-commit" in call
+        sha_index = call.index("--match-head-commit") + 1
+        assert call[sha_index] == branch_head_sha[pr_to_branch[call[2]]]
