@@ -5,6 +5,7 @@ operates, and feature branches pushed to origin. The gate command is injected
 (true/false stand-ins), so no project tests run here.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -240,6 +241,7 @@ def test_corrupt_cache_quarantined_then_selfheals(tmp_path):
 
 
 FAKE_GH_BODY = """# Stub `gh` for the pr-squash landing tests - see write_fake_gh() below.
+import json
 import os
 import subprocess
 import sys
@@ -248,14 +250,28 @@ import tempfile
 
 def main():
     args = sys.argv[1:]
+    argv_log = os.environ.get("FAKE_GH_ARGV_LOG")
+    if argv_log:
+        with open(argv_log, "a") as f:
+            f.write(json.dumps(args) + "\\n")
     if args[:2] == ["pr", "list"]:
         pr_number = os.environ.get("FAKE_GH_PR_NUMBER", "")
         if pr_number:
             print(pr_number)
         return 0
     if args[:2] == ["pr", "merge"]:
-        if os.environ.get("FAKE_GH_MERGE_MODE", "ok") == "fail":
+        mode = os.environ.get("FAKE_GH_MERGE_MODE", "ok")
+        if mode == "fail":
             sys.stderr.write(os.environ.get("FAKE_GH_FAIL_MESSAGE", "merge blocked") + "\\n")
+            return 1
+        if mode == "head_moved":
+            # Simulates GitHub's real rejection when --match-head-commit no
+            # longer matches the server-side head (e.g. main's required-checks
+            # branch moved after the train's local gate approved this SHA).
+            if "--match-head-commit" not in args:
+                sys.stderr.write("fake_gh stub: head_moved mode expects --match-head-commit\\n")
+                return 1
+            sys.stderr.write("Head branch was modified. Review and try the merge again.\\n")
             return 1
         branch = os.environ["FAKE_GH_BRANCH"]
         origin_url = subprocess.run(
@@ -384,6 +400,54 @@ def test_pr_squash_tree_mismatch_is_loud_error(tmp_path, monkeypatch):
 
     assert results[0].status == "error"
     assert "tree mismatch" in results[0].detail
+
+
+def test_pr_squash_passes_match_head_commit_with_correct_sha(tmp_path, monkeypatch):
+    # Closes the approved-then-moved hole: gh must be told the exact SHA the
+    # local gate approved, so GitHub itself refuses the squash server-side if
+    # the branch's head moved after gating (rather than trusting our stale
+    # local read of it).
+    origin, station = make_world(tmp_path)
+    branch_sha = git(origin, "rev-parse", "claude/good")
+    fake_gh = write_fake_gh(tmp_path)
+    argv_log = tmp_path / "argv.log"
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv("FAKE_GH_PR_NUMBER", "1")
+    monkeypatch.setenv("FAKE_GH_MERGE_MODE", "ok")
+    monkeypatch.setenv("FAKE_GH_BRANCH", "claude/good")
+    monkeypatch.setenv("FAKE_GH_ARGV_LOG", str(argv_log))
+
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
+    )
+
+    assert results == [TrainResult(branch="claude/good", status="landed")]
+    calls = [json.loads(line) for line in argv_log.read_text().splitlines()]
+    merge_calls = [c for c in calls if c[:2] == ["pr", "merge"]]
+    assert len(merge_calls) == 1
+    assert "--match-head-commit" in merge_calls[0]
+    sha_index = merge_calls[0].index("--match-head-commit") + 1
+    assert merge_calls[0][sha_index] == branch_sha
+
+
+def test_pr_squash_head_moved_after_gating_is_rejected(tmp_path, monkeypatch):
+    # Simulates GitHub refusing the squash server-side because the branch's
+    # head moved after the local gate approved a now-stale SHA - exactly the
+    # approved-then-moved race --match-head-commit exists to close.
+    origin, station = make_world(tmp_path)
+    before = origin_main(origin)
+    fake_gh = write_fake_gh(tmp_path)
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv("FAKE_GH_PR_NUMBER", "3")
+    monkeypatch.setenv("FAKE_GH_MERGE_MODE", "head_moved")
+
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
+    )
+
+    assert results[0].status == "rejected"
+    assert results[0].detail == "head moved after gating - re-queue"
+    assert origin_main(origin) == before
 
 
 def test_cli_dry_run_red_exits_1(tmp_path):

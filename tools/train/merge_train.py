@@ -17,20 +17,29 @@ Landing modes (--land):
         The local merge commit is still built and gate-tested exactly as in
         push mode - a red branch is caught identically - but landing goes
         through `gh pr merge <number> --squash` against the branch's open PR
-        instead of pushing. The branch's open PR is found via
-        `gh pr list --head <branch> --base main --state open`; no open PR is
-        a "no open PR for branch" error. After a successful gh merge, main
-        is re-fetched and `origin/main^{tree}` is checked against the tree
-        the gate just validated: squashing the same branch onto an unmoved
-        main must reproduce that exact tree, so a mismatch means main moved
-        (or something else is wrong) between the local test and the landing.
-        That is reported loudly as an error ("... tree mismatch -
-        INVESTIGATE") rather than silently trusted or rolled back. A gh
-        merge failure (for example required checks unmet) is a normal
-        rejected outcome for the queue, not a system error - main is reset
-        locally to origin/main and the branch is reported rejected with gh's
-        stderr tail. The `gh` executable name is read from the SWITCHYARD_GH
-        env var (default "gh") so tests can inject a stub.
+        instead of pushing. process_branch captures the exact
+        `origin/<branch>` commit SHA right before building that local merge
+        and passes it as `--match-head-commit <sha>`, so GitHub itself
+        refuses the squash server-side if the branch's head moved after the
+        gate approved this SHA - an approved-then-moved race a bare
+        `gh pr merge --squash` would land anyway. The branch's open PR is
+        found via `gh pr list --head <branch> --base main --state open`; no
+        open PR is a "no open PR for branch" error. After a successful gh
+        merge, main is re-fetched and `origin/main^{tree}` is checked against
+        the tree the gate just validated: squashing the same branch onto an
+        unmoved main must reproduce that exact tree, so a mismatch means main
+        moved (or something else is wrong) between the local test and the
+        landing. That is reported loudly as an error ("... tree mismatch -
+        INVESTIGATE") rather than silently trusted or rolled back. A gh merge
+        failure is a normal rejected outcome for the queue, not a system
+        error - main is reset locally to origin/main and the branch is
+        reported rejected. When gh's stderr indicates the failure was the
+        head-mismatch refusal, the detail is the specific "head moved after
+        gating - re-queue" rather than the raw stderr, so a re-queue is
+        obviously the right response; any other merge failure (for example
+        required checks unmet) keeps gh's stderr tail as the detail. The `gh`
+        executable name is read from the SWITCHYARD_GH env var (default
+        "gh") so tests can inject a stub.
 
 State (at the repo root):
     .train/validated_trees.txt  - cache keys (tree hash + gate argv, hashed)
@@ -202,13 +211,37 @@ def candidates_from_gh(repo: Path) -> list[str]:
     return [p["headRefName"] for p in prs]
 
 
-def _land_via_pr_squash(repo: Path, branch: str, validated_tree: str) -> TrainResult:
+def _looks_like_head_mismatch(gh_output: str) -> bool:
+    """Best-effort detection of a --match-head-commit rejection in gh's output.
+
+    GitHub's merge endpoint rejects a stale expected-head SHA with wording
+    that is not contractually stable across API versions ("Head branch was
+    modified. Review and try the merge again." is the text at time of
+    writing) - matched loosely (case-insensitive "head" plus a
+    change-of-state word) so small upstream wording drift does not silently
+    fall back to the generic "gh pr merge failed" detail. A false negative
+    here still lands as a normal "rejected" outcome with the more generic
+    detail text - never a wrongly-landed branch - so verify this heuristic
+    against a real `gh` refusal before leaning on the specific detail text
+    for automation.
+    """
+    lowered = gh_output.lower()
+    return "head" in lowered and any(
+        word in lowered for word in ("match", "modified", "moved", "changed")
+    )
+
+
+def _land_via_pr_squash(repo: Path, branch: str, validated_tree: str, head_sha: str) -> TrainResult:
     """Land the already gate-tested merge by squash-merging its PR through gh.
 
     Required when main carries a GitHub ruleset (required status checks,
     non-fast-forward) that rejects a direct `git push origin main` with
     GH013. process_branch's local merge commit exists only to compute and
     gate-test `validated_tree`; gh performs the actual landing server-side.
+    `head_sha` is the `origin/<branch>` commit process_branch gate-tested,
+    captured right before its local merge - passed to gh as
+    `--match-head-commit` so a branch that moved after gating is refused by
+    GitHub itself rather than squashed blind.
     """
     gh = _gh_exe()
     pr_list = subprocess.run(
@@ -246,7 +279,7 @@ def _land_via_pr_squash(repo: Path, branch: str, validated_tree: str) -> TrainRe
         return TrainResult(branch, "error", f"no open PR for branch {branch}")
 
     merge = subprocess.run(
-        [gh, "pr", "merge", pr_number, "--squash"],
+        [gh, "pr", "merge", pr_number, "--squash", "--match-head-commit", head_sha],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -257,6 +290,10 @@ def _land_via_pr_squash(repo: Path, branch: str, validated_tree: str) -> TrainRe
         # Blocked by a ruleset (required checks unmet, etc.) is a normal red
         # for the queue, not a system fault - same status class as a failed gate.
         tail = (merge.stdout + merge.stderr).strip()[-2000:]
+        if _looks_like_head_mismatch(tail):
+            # The SHA gating approved is stale: GitHub itself caught the race
+            # instead of us squashing a head we never actually tested.
+            return TrainResult(branch, "rejected", "head moved after gating - re-queue")
         return TrainResult(branch, "rejected", f"gh pr merge failed:\n{tail}")
 
     _git(repo, "fetch", "origin")
@@ -294,6 +331,10 @@ def process_branch(
         return TrainResult(branch, "conflict", f"textual conflict vs main: {files}")
     if replay.returncode > 1:
         return TrainResult(branch, "error", replay.stderr.strip())
+
+    # Captured right before the merge so pr-squash mode can pin gh's landing
+    # to exactly the commit gating approved (see _land_via_pr_squash).
+    head_sha = _git(repo, "rev-parse", f"origin/{branch}").stdout.strip()
 
     merge = _git(
         repo,
@@ -354,7 +395,7 @@ def process_branch(
         return TrainResult(branch, "landed", "dry-run: validated, not pushed")
 
     if land == "pr-squash":
-        return _land_via_pr_squash(repo, branch, tree)
+        return _land_via_pr_squash(repo, branch, tree, head_sha)
 
     push = _git(repo, "push", "origin", "main", check=False)
     if push.returncode != 0:
