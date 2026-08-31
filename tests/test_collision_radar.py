@@ -79,3 +79,20 @@ def test_merged_branches_excluded(tmp_path):
     git(repo, "checkout", "main")
     names = {r["a"] for r in scan(repo)} | {r["b"] for r in scan(repo)}
     assert "claude/done" not in names
+
+
+def test_squash_merged_branch_excluded(tmp_path):
+    # A squash-merged branch keeps commits forever "unmerged" by ancestry -
+    # its content already sits on main under a different commit, but
+    # main..branch rev-list stays > 0. Without a content check this branch
+    # would count as live forever and inflate the radar/WIP cap.
+    repo = make_repo(tmp_path)
+    git(repo, "checkout", "-b", "claude/squashed", "main")
+    (repo / "other.txt").write_text("squashed change\n")
+    git(repo, "commit", "-am", "squashed")
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--squash", "claude/squashed")
+    git(repo, "commit", "-m", "squash merge claude/squashed")
+
+    names = {r["a"] for r in scan(repo)} | {r["b"] for r in scan(repo)}
+    assert "claude/squashed" not in names

@@ -27,15 +27,35 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def live_branches(repo: Path) -> list[str]:
-    """Branches with commits not on main, filtered to work-track prefixes."""
+    """Branches with commits not on main, filtered to work-track prefixes.
+
+    A squash-merged branch keeps its own commits forever "unmerged" by
+    ancestry - its content already sits on main under main's own commit, but
+    `main..branch` rev-list stays > 0 forever. Left unchecked that branch
+    counts as a live track for eternity, inflating the WIP cap and the
+    radar's noise.
+
+    The second check is a direct tip-vs-tip `git diff --quiet main branch`
+    (no dots - for `diff`, unlike `log`, `A..B` means the same thing as
+    `A B`), deliberately NOT the three-dot merge-base form: three-dot diffs
+    the branch's tip against `merge-base(main, branch)`, which still shows
+    the branch's own historical change and stays non-empty forever, even
+    after that exact content has since landed on main under a different
+    commit (squash-merge). Only the direct tip-vs-tip tree comparison goes
+    quiet once main already carries everything the branch has to offer.
+    """
     out = _git(repo, "for-each-ref", "refs/heads", "--format=%(refname:short)")
     branches = []
     for name in out.stdout.split():
         if not name.startswith(LIVE_PREFIXES):
             continue
         count = _git(repo, "rev-list", "--count", f"main..{name}")
-        if count.returncode == 0 and int(count.stdout.strip() or 0) > 0:
-            branches.append(name)
+        if count.returncode != 0 or int(count.stdout.strip() or 0) <= 0:
+            continue
+        diff = _git(repo, "diff", "--quiet", "main", name)
+        if diff.returncode == 0:
+            continue  # no content difference from main - already landed
+        branches.append(name)
     return sorted(branches)
 
 
