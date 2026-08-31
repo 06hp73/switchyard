@@ -1,0 +1,16 @@
+{
+  "sample": {
+    "en": {
+      "empty": {},
+      "title": "Investment overview"
+    },
+    "sv": {
+      "empty": {},
+      "title": "Investeringsöversikt åäö"
+    }
+  },
+  "sidecars": {
+    "placeholders": {},
+    "tabLabels": {}
+  }
+}
