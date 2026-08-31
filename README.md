@@ -94,7 +94,7 @@ of crashing — a broken config must never brick a guard. See
 
 ## Tests
 
-78 tests, plain pytest, no project dependencies:
+82 tests, plain pytest, no project dependencies:
 
 ```bash
 python3 -m pytest tests/ -q
