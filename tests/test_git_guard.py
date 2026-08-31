@@ -12,22 +12,36 @@ from pathlib import Path
 GUARD = Path(__file__).resolve().parents[1] / "tools" / "guards" / "git_guard.sh"
 
 
-def run_guard(command: str) -> subprocess.CompletedProcess:
-    payload = json.dumps({"tool_input": {"command": command}, "cwd": "/tmp"})
+def run_guard(command: str, cwd: str = "/tmp") -> subprocess.CompletedProcess:
+    payload = json.dumps({"tool_input": {"command": command}, "cwd": cwd})
     return subprocess.run(
         ["bash", str(GUARD)], input=payload, capture_output=True, text=True, timeout=10
     )
 
 
-def assert_blocked(command: str, needle: str) -> None:
-    result = run_guard(command)
+def assert_blocked(command: str, needle: str, cwd: str = "/tmp") -> None:
+    result = run_guard(command, cwd=cwd)
     assert result.returncode == 2, f"expected block for: {command}"
     assert needle in result.stderr
 
 
-def assert_allowed(command: str) -> None:
-    result = run_guard(command)
+def assert_allowed(command: str, cwd: str = "/tmp") -> None:
+    result = run_guard(command, cwd=cwd)
     assert result.returncode == 0, f"expected allow for: {command}\nstderr: {result.stderr}"
+
+
+def make_repo_with_origin(base: Path, name: str, origin_url: str | None) -> Path:
+    """Create a real tmp git repo (optionally with an 'origin' remote) to use as cwd."""
+    repo = base / name
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    if origin_url is not None:
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", origin_url],
+            check=True,
+            capture_output=True,
+        )
+    return repo
 
 
 def test_blocks_git_stash():
@@ -68,6 +82,36 @@ def test_blocks_direct_push_to_main():
     assert_blocked("git push origin fix-branch:main", "train")
     assert_blocked("git push origin :main", "train")
     assert_blocked("git push origin HEAD:refs/heads/main", "train")
+
+
+def test_main_push_ban_scoped_to_product_repo_origin(tmp_path):
+    # The rule only applies when cwd's origin is the product repo (06hp73/EV4SIM).
+    product_repo = make_repo_with_origin(
+        tmp_path, "product", "https://github.com/06hp73/EV4SIM.git"
+    )
+    assert_blocked("git push origin main", "train", cwd=str(product_repo))
+
+    # switchyard's own main is a different repo entirely - pushing it is fine.
+    switchyard_repo = make_repo_with_origin(
+        tmp_path, "switchyard", "https://github.com/06hp73/switchyard.git"
+    )
+    assert_allowed("git push origin main", cwd=str(switchyard_repo))
+
+    # ssh remote form must match too - not just the https form.
+    ssh_repo = make_repo_with_origin(tmp_path, "ssh-clone", "git@github.com:06hp73/EV4SIM.git")
+    assert_blocked("git push origin main", "train", cwd=str(ssh_repo))
+
+
+def test_main_push_ban_fail_safe_when_origin_undeterminable(tmp_path):
+    # A real git repo with no 'origin' remote at all: the rule cannot determine
+    # the repo's identity, so it must stay enforced (fail-safe toward protection).
+    no_origin_repo = tmp_path / "no-origin"
+    no_origin_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(no_origin_repo)], check=True, capture_output=True)
+    assert_blocked("git push origin main", "train", cwd=str(no_origin_repo))
+
+    # A cwd that plain doesn't exist at all is equally undeterminable.
+    assert_blocked("git push origin main", "train", cwd=str(tmp_path / "does-not-exist"))
 
 
 def test_allows_feature_branch_push():

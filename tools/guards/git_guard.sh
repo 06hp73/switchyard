@@ -5,7 +5,8 @@
 #     four independent incident reports; CLAUDE.md mandates WIP commits instead)
 #   - git config user.* (identity drift breaks deploy author validation silently)
 #   - force pushes
-#   - any push to main (main is written exclusively by the merge train)
+#   - any push to main IN THE PRODUCT REPO (main is written exclusively by the
+#     merge train there; other repos are out of scope, see below)
 #   - rm -rf on worktree directories (orphans git metadata; use git worktree remove)
 # Exit 0 = allow, exit 2 = block with reason on stderr.
 # Fail-open on parse errors: a broken guard must never paralyze sessions.
@@ -13,6 +14,24 @@
 INPUT=$(cat 2>/dev/null) || exit 0
 CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null) || exit 0
 [ -z "$CMD" ] && exit 0
+CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
+
+# The main-push ban below is scoped to the product repo (06hp73/EV4SIM) only:
+# switchyard is itself a standalone repo (github.com/06hp73/switchyard) whose
+# own main has no branch-protection ruleset, and its merge train pushes main
+# directly there - a global ban would wrongly block that legitimate push too.
+# Identity is decided by cwd's `origin` remote URL, not by path shape (a
+# worktree of either repo can live anywhere). Fail-safe: if cwd is missing,
+# not a git repo, or has no resolvable `origin`, the ban STAYS ENFORCED - an
+# unknown repo is treated as the protected one, never the reverse.
+MAIN_PUSH_GUARD_ACTIVE=1
+if [ -n "$CWD" ] && ORIGIN_URL=$(git -C "$CWD" remote get-url origin 2>/dev/null) \
+   && [ -n "$ORIGIN_URL" ]; then
+  case "$ORIGIN_URL" in
+    *06hp73/EV4SIM*) : ;;  # the product repo - stays enforced
+    *) MAIN_PUSH_GUARD_ACTIVE=0 ;;
+  esac
+fi
 
 block() {
   echo "Blocked by git_guard: $1" >&2
@@ -91,7 +110,8 @@ fi
 # required [[:space:]] before the group and ([[:space:]]|[;&|]) after it
 # still anchor the match to a whole ref token, so "feature:main-fix" (whose
 # right side is "main-fix", not "main") is correctly left alone.
-if printf ' %s ' "$NORM" | grep -qE 'git[[:space:]]+push\b[^;&|]*[[:space:]]([^[:space:]]*:refs/heads/main|[^[:space:]]*:main|refs/heads/main|main)([[:space:]]|[;&|])'; then
+if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ] \
+   && printf ' %s ' "$NORM" | grep -qE 'git[[:space:]]+push\b[^;&|]*[[:space:]]([^[:space:]]*:refs/heads/main|[^[:space:]]*:main|refs/heads/main|main)([[:space:]]|[;&|])'; then
   block "pushing to main is reserved for the merge train. Push your feature branch and mark the PR ready; the train lands it after testing the combined tree."
 fi
 
