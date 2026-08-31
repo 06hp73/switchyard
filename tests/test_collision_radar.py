@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "radar"))
 
-from collision_radar import scan  # noqa: E402  (path set up above)
+from collision_radar import live_branches, scan  # noqa: E402  (path set up above)
 
 
 def git(repo: Path, *args: str) -> None:
@@ -96,3 +96,19 @@ def test_squash_merged_branch_excluded(tmp_path):
 
     names = {r["a"] for r in scan(repo)} | {r["b"] for r in scan(repo)}
     assert "claude/squashed" not in names
+
+
+def test_live_branches_custom_prefixes(tmp_path):
+    # Default prefixes (claude/, fix/, feat/) never match "release/" at all -
+    # live_branches' prefixes param, not just its hardcoded module default,
+    # must be what actually gates inclusion.
+    repo = make_repo(tmp_path)
+    git(repo, "checkout", "-b", "release/x", "main")
+    (repo / "shared.txt").write_text("release change\nline2\nline3\n")
+    git(repo, "commit", "-am", "release change")
+    git(repo, "checkout", "main")
+
+    assert "release/x" not in live_branches(repo)
+    assert "release/x" in live_branches(repo, prefixes=("release/",))
+    # A custom prefix set also EXCLUDES branches the default would include.
+    assert "claude/a" not in live_branches(repo, prefixes=("release/",))

@@ -16,6 +16,10 @@ CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null) || e
 [ -z "$CMD" ] && exit 0
 CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/config_get.sh
+source "$SCRIPT_DIR/../lib/config_get.sh"
+
 # The main-push ban below is scoped to the product repo (06hp73/EV4SIM) only:
 # switchyard is itself a standalone repo (github.com/06hp73/switchyard) whose
 # own main has no branch-protection ruleset, and its merge train pushes main
@@ -27,8 +31,14 @@ CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
 MAIN_PUSH_GUARD_ACTIVE=1
 if [ -n "$CWD" ] && ORIGIN_URL=$(git -C "$CWD" remote get-url origin 2>/dev/null) \
    && [ -n "$ORIGIN_URL" ]; then
+  # switchyard.toml's product_remote_match overrides which origin substring
+  # identifies "the protected product repo"; empty (the default when
+  # unconfigured) keeps this hardcoded fallback so existing behavior is
+  # unchanged with no config file present.
+  PRODUCT_MATCH=$(sy_cfg product_remote_match "")
+  [ -z "$PRODUCT_MATCH" ] && PRODUCT_MATCH="06hp73/EV4SIM"
   case "$ORIGIN_URL" in
-    *06hp73/EV4SIM*) : ;;  # the product repo - stays enforced
+    *"$PRODUCT_MATCH"*) : ;;  # the product repo - stays enforced
     *) MAIN_PUSH_GUARD_ACTIVE=0 ;;
   esac
 fi

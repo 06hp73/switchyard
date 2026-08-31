@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # SessionStart summary: how many live (unmerged) tracks exist, WIP cap state.
 # Prints one line; never fails the session (always exit 0).
-CAP=5
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/config_get.sh
+source "$SCRIPT_DIR/../lib/config_get.sh"
+CAP=$(sy_cfg wip_cap 5)
+# live_prefixes comes back comma-joined, e.g. "claude/,fix/,feat/" - turned
+# into an anchored alternation. Functionally identical to the old hardcoded
+# '^(claude|fix|feat)/' (a prefix immediately followed by '/' either way).
+PREFIXES=$(sy_cfg live_prefixes "claude/,fix/,feat/")
+PREFIX_RE="^($(printf '%s' "$PREFIXES" | sed 's/,/|/g'))"
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || exit 0
 LIVE=$(git for-each-ref refs/heads --format='%(refname:short)' 2>/dev/null \
-  | grep -E '^(claude|fix|feat)/' \
+  | grep -E "$PREFIX_RE" \
   | while read -r br; do
       n=$(git rev-list --count main.."$br" 2>/dev/null || echo 0)
       # A squash-merged branch keeps commits forever "unmerged" by ancestry

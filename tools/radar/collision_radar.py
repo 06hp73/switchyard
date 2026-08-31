@@ -17,6 +17,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from switchyard_config import load_config  # noqa: E402
+
 LIVE_PREFIXES = ("claude/", "fix/", "feat/")
 
 
@@ -26,7 +29,9 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def live_branches(repo: Path) -> list[str]:
+def live_branches(
+    repo: Path, prefixes: tuple[str, ...] = LIVE_PREFIXES, protected: str = "main"
+) -> list[str]:
     """Branches with commits not on main, filtered to work-track prefixes.
 
     A squash-merged branch keeps its own commits forever "unmerged" by
@@ -47,14 +52,14 @@ def live_branches(repo: Path) -> list[str]:
     out = _git(repo, "for-each-ref", "refs/heads", "--format=%(refname:short)")
     branches = []
     for name in out.stdout.split():
-        if not name.startswith(LIVE_PREFIXES):
+        if not name.startswith(prefixes):
             continue
-        count = _git(repo, "rev-list", "--count", f"main..{name}")
+        count = _git(repo, "rev-list", "--count", f"{protected}..{name}")
         if count.returncode != 0 or int(count.stdout.strip() or 0) <= 0:
             continue
-        diff = _git(repo, "diff", "--quiet", "main", name)
+        diff = _git(repo, "diff", "--quiet", protected, name)
         if diff.returncode == 0:
-            continue  # no content difference from main - already landed
+            continue  # no content difference from the protected branch - already landed
         branches.append(name)
     return sorted(branches)
 
@@ -75,9 +80,11 @@ def replay_pair(repo: Path, a: str, b: str) -> dict:
     raise RuntimeError(f"merge-tree failed for {a} x {b}: {result.stderr.strip()}")
 
 
-def scan(repo: Path) -> list[dict]:
-    branches = live_branches(repo)
-    results = [replay_pair(repo, branch, "main") for branch in branches]
+def scan(
+    repo: Path, prefixes: tuple[str, ...] = LIVE_PREFIXES, protected: str = "main"
+) -> list[dict]:
+    branches = live_branches(repo, prefixes, protected)
+    results = [replay_pair(repo, branch, protected) for branch in branches]
     results += [replay_pair(repo, a, b) for a, b in itertools.combinations(branches, 2)]
     return results
 
@@ -89,7 +96,8 @@ def main() -> int:
     parser.add_argument("--fail-on-conflict", action="store_true")
     args = parser.parse_args()
 
-    results = scan(args.repo)
+    cfg = load_config(args.repo)
+    results = scan(args.repo, prefixes=tuple(cfg.live_prefixes), protected=cfg.protected_branch)
     conflicts = [r for r in results if not r["clean"]]
     if args.json:
         print(json.dumps(results, indent=2))

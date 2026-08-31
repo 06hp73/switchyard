@@ -15,9 +15,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "train"))
-MERGE_TRAIN_SCRIPT = (
-    Path(__file__).resolve().parents[1] / "tools" / "train" / "merge_train.py"
-)
+MERGE_TRAIN_SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "train" / "merge_train.py"
 
 from merge_train import TrainResult, _cache_key, run_train  # noqa: E402
 
@@ -41,10 +39,10 @@ def git(cwd: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def make_world(tmp_path: Path) -> tuple[Path, Path]:
+def make_world(tmp_path: Path, protected: str = "main") -> tuple[Path, Path]:
     origin = tmp_path / "origin.git"
     origin.mkdir()
-    git(origin, "init", "--bare", "-b", "main")
+    git(origin, "init", "--bare", "-b", protected)
     seed = tmp_path / "seed"
     subprocess.run(
         ["git", "clone", str(origin), str(seed)],
@@ -55,17 +53,17 @@ def make_world(tmp_path: Path) -> tuple[Path, Path]:
     (seed / "app.txt").write_text("v1\n")
     git(seed, "add", "-A")
     git(seed, "commit", "-m", "base")
-    git(seed, "push", "origin", "main")
+    git(seed, "push", "origin", protected)
     for name, content in [
         ("claude/good", "good change\n"),
         ("claude/bad", "bad change\n"),
     ]:
-        git(seed, "checkout", "-b", name, "main")
+        git(seed, "checkout", "-b", name, protected)
         (seed / f"{name.split('/')[1]}.txt").write_text(content)
         git(seed, "add", "-A")
         git(seed, "commit", "-m", name)
         git(seed, "push", "origin", name)
-        git(seed, "checkout", "main")
+        git(seed, "checkout", protected)
     station = tmp_path / "station"
     subprocess.run(
         ["git", "clone", str(origin), str(station)],
@@ -142,9 +140,7 @@ def test_cache_is_gate_specific(tmp_path):
     before = origin_main(origin)
     counter = tmp_path / "false_count"
     false_gate = ["/bin/sh", "-c", f"echo x >> {counter}; exit 1"]
-    run_train(
-        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], dry_run=True
-    )
+    run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"], dry_run=True)
     results = run_train(repo=station, branches=["claude/good"], gate=false_gate)
     assert results[0].status == "rejected"
     assert counter.exists() and len(counter.read_text().splitlines()) == 1
@@ -190,9 +186,7 @@ def test_missing_gate_binary_is_error_and_queue_continues(tmp_path):
         branches=["claude/bad", "claude/good"],
         gate=None,
         gate_factory=lambda branch: (
-            ["/nonexistent/gate-binary"]
-            if branch == "claude/bad"
-            else ["/usr/bin/true"]
+            ["/nonexistent/gate-binary"] if branch == "claude/bad" else ["/usr/bin/true"]
         ),
     )
     assert [r.status for r in results] == ["error", "landed"]
@@ -215,9 +209,7 @@ def test_gate_timeout_kills_process_tree(tmp_path):
     sleeper_pid_file = tmp_path / "sleeper_pid"
     gate = ["/bin/sh", "-c", f"(sleep 30 & echo $! > {sleeper_pid_file}; wait)"]
 
-    results = run_train(
-        repo=station, branches=["claude/good"], gate=gate, gate_timeout=1
-    )
+    results = run_train(repo=station, branches=["claude/good"], gate=gate, gate_timeout=1)
 
     assert results[0].status == "rejected"
     assert origin_main(origin) == before
@@ -451,9 +443,7 @@ def test_pr_squash_merge_rejected_leaves_main_unmoved(tmp_path, monkeypatch):
     monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
     monkeypatch.setenv("FAKE_GH_PR_NUMBER", "7")
     monkeypatch.setenv("FAKE_GH_MERGE_MODE", "fail")
-    monkeypatch.setenv(
-        "FAKE_GH_FAIL_MESSAGE", "required status checks have not been met"
-    )
+    monkeypatch.setenv("FAKE_GH_FAIL_MESSAGE", "required status checks have not been met")
 
     results = run_train(
         repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
@@ -573,9 +563,7 @@ def test_batch_one_is_byte_equivalent_to_unbatched(tmp_path):
     # explicitly: the batch parameter must not change the plain path at all.
     origin, station = make_world(tmp_path)
     before = origin_main(origin)
-    results = run_train(
-        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], batch=1
-    )
+    results = run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"], batch=1)
     assert results == [TrainResult(branch="claude/good", status="landed")]
     assert origin_main(origin) != before
 
@@ -585,9 +573,7 @@ def test_batch_green_lands_all_with_one_gate_run(tmp_path):
     counter = tmp_path / "count"
     gate = ["/bin/sh", "-c", f"echo x >> {counter}; exit 0"]
 
-    results = run_train(
-        repo=station, branches=["claude/good", "claude/bad"], gate=gate, batch=2
-    )
+    results = run_train(repo=station, branches=["claude/good", "claude/bad"], gate=gate, batch=2)
 
     assert [r.status for r in results] == ["landed", "landed"]
     assert len(counter.read_text().splitlines()) == 1
@@ -608,9 +594,7 @@ def test_batch_red_bisects_to_culprit(tmp_path):
         f"echo x >> {counter}; test -f bad.txt && exit 1 || exit 0",
     ]
 
-    results = run_train(
-        repo=station, branches=["claude/good", "claude/bad"], gate=gate, batch=2
-    )
+    results = run_train(repo=station, branches=["claude/good", "claude/bad"], gate=gate, batch=2)
 
     assert [r.status for r in results] == ["landed", "rejected"]
     # Three gate runs: the full pair (red), then each half alone (AB, A, B) -
@@ -651,9 +635,7 @@ def test_batch_prsquash_final_tree_verified(tmp_path, monkeypatch):
     fake_gh = write_fake_gh_multi(tmp_path)
     argv_log = tmp_path / "argv.log"
     monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
-    monkeypatch.setenv(
-        "FAKE_GH_BRANCH_PRS", json.dumps({"claude/good": "1", "claude/bad": "2"})
-    )
+    monkeypatch.setenv("FAKE_GH_BRANCH_PRS", json.dumps({"claude/good": "1", "claude/bad": "2"}))
     monkeypatch.setenv("FAKE_GH_ARGV_LOG", str(argv_log))
 
     results = run_train(
@@ -682,3 +664,75 @@ def test_batch_prsquash_final_tree_verified(tmp_path, monkeypatch):
         assert "--match-head-commit" in call
         sha_index = call.index("--match-head-commit") + 1
         assert call[sha_index] == branch_head_sha[pr_to_branch[call[2]]]
+
+
+# --- switchyard.toml config threading ---------------------------------------
+
+
+def test_pr_sort_key_prioritizes_priority_label_then_number():
+    from merge_train import _pr_sort_key
+
+    prs = [
+        {"number": 5, "headRefName": "b", "labels": []},
+        {"number": 2, "headRefName": "a", "labels": [{"name": "train-priority"}]},
+        {"number": 1, "headRefName": "c", "labels": []},
+    ]
+    ordered = sorted(prs, key=lambda p: _pr_sort_key(p, "train-priority"))
+    assert [p["headRefName"] for p in ordered] == ["a", "c", "b"]
+
+
+def test_protected_branch_param_used_when_default_branch_is_not_main(tmp_path):
+    # run_train's protected="main" default is only a fallback for callers that
+    # never touch config; passing a different name must retarget every "main"
+    # the train would otherwise hardcode (checkout, reset, push, merge-tree
+    # base) - proven here with a world whose default branch is "trunk", not
+    # "main", which would fail fast (checkout of a nonexistent local "main")
+    # if any hardcoded literal survived the refactor.
+    origin, station = make_world(tmp_path, protected="trunk")
+    before = git(origin, "rev-parse", "trunk")
+
+    results = run_train(
+        repo=station,
+        branches=["claude/good"],
+        gate=["/usr/bin/true"],
+        protected="trunk",
+    )
+
+    assert results == [TrainResult(branch="claude/good", status="landed")]
+    assert git(origin, "rev-parse", "trunk") != before
+    assert git(origin, "show", "trunk:good.txt") == "good change"
+
+
+def test_train_respects_config_gate_fast_and_batch_via_switchyard_toml(tmp_path):
+    # main() is the only layer that reads config (run_train itself stays
+    # config-agnostic, see the module docstring) - so this drives the real
+    # CLI as a subprocess. Neither --gate nor --batch is passed: if config
+    # threading were broken, --gate would fall back to GATE_DEFAULT (bash
+    # tools/train/gate.sh, which does not exist in this throwaway station
+    # clone) and batch would stay 1, landing one branch per gate run instead
+    # of both branches through a single configured gate.
+    origin, station = make_world(tmp_path)
+    config = tmp_path / "switchyard.toml"
+    config.write_text('[switchyard]\ngate_fast = "/usr/bin/true"\nbatch = 2\n')
+
+    cli = [
+        sys.executable,
+        str(MERGE_TRAIN_SCRIPT),
+        "run",
+        "--repo",
+        str(station),
+        "--branch",
+        "claude/good",
+        "--branch",
+        "claude/bad",
+    ]
+    proc = subprocess.run(
+        cli,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "SWITCHYARD_CONFIG": str(config)},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert git(origin, "show", "main:good.txt") == "good change"
+    assert git(origin, "show", "main:bad.txt") == "bad change"

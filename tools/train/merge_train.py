@@ -72,6 +72,14 @@ Batch mode (--batch N, default 1 = today's plain per-branch behavior):
     status a lone branch gets from the unbatched path.
         Every input branch, batched or not, ends with exactly one TrainResult.
 
+Config (switchyard.toml, see tools/lib/switchyard_config.py): main() loads
+the effective config and uses it to fill in whatever --gate/--gate-timeout/
+--batch leave unset, and to supply the protected branch name and the
+priority label candidates_from_gh sorts on. Nothing here reads config below
+main() - run_train() and everything it calls take plain parameters, so
+every existing caller (including every test in this file) that never
+mentions config keeps today's exact hardcoded-default behavior.
+
 State (at the repo root):
     .train/validated_trees.txt  - cache keys (tree hash + gate argv, hashed)
                                   whose gate already passed
@@ -84,7 +92,8 @@ Usage:
         [--batch N] [--dry-run]
 Without --branch, candidates come from
     gh pr list --state open --draft=false --base main
-ordered oldest first (FIFO by PR number).
+ordered with any priority-labeled PRs first, then oldest first (FIFO by PR
+number) within each group.
 
 Exit codes: 0 nothing errored (rejected/conflict branches are a normal
 result, not a failure); 1 only under --dry-run, when some branch would not
@@ -105,6 +114,9 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from switchyard_config import load_config  # noqa: E402
 
 GATE_DEFAULT = ["bash", "tools/train/gate.sh"]
 GATE_TIMEOUT_DEFAULT = 5400
@@ -197,9 +209,7 @@ def _validated_keys(repo: Path) -> set[str]:
         quarantine = path.with_suffix(".corrupt")
         try:
             os.replace(path, quarantine)
-            print(
-                f"train: quarantined unreadable gate cache to {quarantine.name} ({exc})"
-            )
+            print(f"train: quarantined unreadable gate cache to {quarantine.name} ({exc})")
         except OSError as replace_exc:
             print(
                 f"train: ignoring unreadable gate cache ({exc}); quarantine failed: {replace_exc}"
@@ -217,7 +227,16 @@ def _gh_exe() -> str:
     return os.environ.get("SWITCHYARD_GH", "gh")
 
 
-def candidates_from_gh(repo: Path) -> list[str]:
+def _pr_sort_key(pr: dict, priority_label: str) -> tuple[int, int]:
+    """Priority-labeled PRs land first; FIFO by PR number within each group -
+    oldest first, same tie-break the queue always used before priority existed."""
+    labels = {label.get("name") for label in (pr.get("labels") or [])}
+    return (0 if priority_label in labels else 1, pr["number"])
+
+
+def candidates_from_gh(
+    repo: Path, protected: str = "main", priority_label: str = "train-priority"
+) -> list[str]:
     proc = subprocess.run(
         [
             _gh_exe(),
@@ -227,11 +246,11 @@ def candidates_from_gh(repo: Path) -> list[str]:
             "open",
             "--draft=false",
             "--base",
-            "main",
+            protected,
             "--limit",
             "100",
             "--json",
-            "number,headRefName",
+            "number,headRefName,labels",
         ],
         capture_output=True,
         text=True,
@@ -240,7 +259,7 @@ def candidates_from_gh(repo: Path) -> list[str]:
     )
     if proc.returncode != 0:
         raise SystemExit(f"gh pr list failed: {proc.stderr.strip()}")
-    prs = sorted(json.loads(proc.stdout), key=lambda p: p["number"])
+    prs = sorted(json.loads(proc.stdout), key=lambda p: _pr_sort_key(p, priority_label))
     return [p["headRefName"] for p in prs]
 
 
@@ -264,7 +283,9 @@ def _looks_like_head_mismatch(gh_output: str) -> bool:
     )
 
 
-def _squash_one(repo: Path, gh: str, branch: str, head_sha: str) -> TrainResult | None:
+def _squash_one(
+    repo: Path, gh: str, branch: str, head_sha: str, protected: str = "main"
+) -> TrainResult | None:
     """Squash-merge `branch`'s open PR through gh, pinned to `head_sha`.
 
     Shared by the single-branch pr-squash landing path and the batch one -
@@ -287,7 +308,7 @@ def _squash_one(repo: Path, gh: str, branch: str, head_sha: str) -> TrainResult 
             "--head",
             branch,
             "--base",
-            "main",
+            protected,
             "--state",
             "open",
             "--json",
@@ -303,9 +324,7 @@ def _squash_one(repo: Path, gh: str, branch: str, head_sha: str) -> TrainResult 
         timeout=60,
     )
     if pr_list.returncode != 0:
-        return TrainResult(
-            branch, "error", f"gh pr list failed: {pr_list.stderr.strip()[:400]}"
-        )
+        return TrainResult(branch, "error", f"gh pr list failed: {pr_list.stderr.strip()[:400]}")
 
     # `.[0].number` on an empty PR list is jq null, not an error - a "null" or
     # blank stdout both mean the same thing here: no open PR to land through.
@@ -334,7 +353,7 @@ def _squash_one(repo: Path, gh: str, branch: str, head_sha: str) -> TrainResult 
 
 
 def _land_via_pr_squash(
-    repo: Path, branch: str, validated_tree: str, head_sha: str
+    repo: Path, branch: str, validated_tree: str, head_sha: str, protected: str = "main"
 ) -> TrainResult:
     """Land the already gate-tested merge by squash-merging its PR through gh.
 
@@ -348,20 +367,20 @@ def _land_via_pr_squash(
     GitHub itself rather than squashed blind.
     """
     gh = _gh_exe()
-    failure = _squash_one(repo, gh, branch, head_sha)
+    failure = _squash_one(repo, gh, branch, head_sha, protected)
     if failure is not None:
-        _git(repo, "reset", "--hard", "origin/main")
+        _git(repo, "reset", "--hard", f"origin/{protected}")
         return failure
 
     _git(repo, "fetch", "origin")
-    landed_tree = _git(repo, "rev-parse", "origin/main^{tree}").stdout.strip()
+    landed_tree = _git(repo, "rev-parse", f"origin/{protected}^{{tree}}").stdout.strip()
     if landed_tree != validated_tree:
         # main moved (or something else is wrong) between the local gate test
         # and gh's landing. Loud and stop - no rollback attempt, main is
         # already live and a guessed "fix" could make a real mess worse.
         return TrainResult(branch, "error", "landed but tree mismatch - INVESTIGATE")
 
-    _git(repo, "reset", "--hard", "origin/main")
+    _git(repo, "reset", "--hard", f"origin/{protected}")
     return TrainResult(branch, "landed")
 
 
@@ -419,24 +438,21 @@ def process_branch(
     dry_run: bool,
     gate_timeout: int,
     land: str = "push",
+    protected: str = "main",
 ) -> TrainResult:
     _git(repo, "fetch", "origin", "--prune")
-    _git(repo, "checkout", "main")
-    _git(repo, "reset", "--hard", "origin/main")
+    _git(repo, "checkout", protected)
+    _git(repo, "reset", "--hard", f"origin/{protected}")
 
-    replay = _git(
-        repo, "merge-tree", "--write-tree", f"origin/{branch}", "main", check=False
-    )
+    replay = _git(repo, "merge-tree", "--write-tree", f"origin/{branch}", protected, check=False)
     ghost_signatures = ("not something we can merge", "could not resolve")
     if replay.returncode != 0 and any(
         sig in (replay.stderr + replay.stdout) for sig in ghost_signatures
     ):
-        return TrainResult(
-            branch, "error", f"branch origin/{branch} not found on origin"
-        )
+        return TrainResult(branch, "error", f"branch origin/{branch} not found on origin")
     if replay.returncode == 1:
         files = ", ".join(replay.stdout.splitlines()[1:6])
-        return TrainResult(branch, "conflict", f"textual conflict vs main: {files}")
+        return TrainResult(branch, "conflict", f"textual conflict vs {protected}: {files}")
     if replay.returncode > 1:
         return TrainResult(branch, "error", replay.stderr.strip())
 
@@ -455,7 +471,7 @@ def process_branch(
     )
     if merge.returncode != 0:
         _git(repo, "merge", "--abort", check=False)
-        _git(repo, "reset", "--hard", "origin/main")
+        _git(repo, "reset", "--hard", f"origin/{protected}")
         return TrainResult(branch, "conflict", merge.stderr.strip()[:400])
 
     tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
@@ -463,19 +479,19 @@ def process_branch(
     key = _cache_key(tree, gate)
     gate_detail = _run_gate(repo, gate, gate_timeout, dry_run, key)
     if gate_detail is not None:
-        _git(repo, "reset", "--hard", "origin/main")
+        _git(repo, "reset", "--hard", f"origin/{protected}")
         return TrainResult(branch, "rejected", gate_detail)
 
     if dry_run:
-        _git(repo, "reset", "--hard", "origin/main")
+        _git(repo, "reset", "--hard", f"origin/{protected}")
         return TrainResult(branch, "landed", "dry-run: validated, not pushed")
 
     if land == "pr-squash":
-        return _land_via_pr_squash(repo, branch, tree, head_sha)
+        return _land_via_pr_squash(repo, branch, tree, head_sha, protected)
 
-    push = _git(repo, "push", "origin", "main", check=False)
+    push = _git(repo, "push", "origin", protected, check=False)
     if push.returncode != 0:
-        _git(repo, "reset", "--hard", "origin/main")
+        _git(repo, "reset", "--hard", f"origin/{protected}")
         return TrainResult(branch, "error", f"push failed: {push.stderr.strip()[:400]}")
     return TrainResult(branch, "landed")
 
@@ -485,7 +501,7 @@ def process_branch(
 
 
 def _build_candidate_group(
-    repo: Path, group: list[str]
+    repo: Path, group: list[str], protected: str = "main"
 ) -> tuple[list[str], list[TrainResult], dict[str, str]]:
     """Sequentially merge `group`'s branches onto the checked-out main.
 
@@ -516,24 +532,20 @@ def _build_candidate_group(
     head_shas: dict[str, str] = {}
     for branch in group:
         replay = _git(
-            repo, "merge-tree", "--write-tree", f"origin/{branch}", "main", check=False
+            repo, "merge-tree", "--write-tree", f"origin/{branch}", protected, check=False
         )
         ghost_signatures = ("not something we can merge", "could not resolve")
         if replay.returncode != 0 and any(
             sig in (replay.stderr + replay.stdout) for sig in ghost_signatures
         ):
             set_aside.append(
-                TrainResult(
-                    branch, "error", f"branch origin/{branch} not found on origin"
-                )
+                TrainResult(branch, "error", f"branch origin/{branch} not found on origin")
             )
             continue
         if replay.returncode == 1:
             files = ", ".join(replay.stdout.splitlines()[1:6])
             set_aside.append(
-                TrainResult(
-                    branch, "conflict", f"textual conflict vs candidate: {files}"
-                )
+                TrainResult(branch, "conflict", f"textual conflict vs candidate: {files}")
             )
             continue
         if replay.returncode > 1:
@@ -554,9 +566,7 @@ def _build_candidate_group(
             # Abort just this failed attempt, not a full reset, so the rest
             # of the group keeps building on top of what came before it.
             _git(repo, "merge", "--abort", check=False)
-            set_aside.append(
-                TrainResult(branch, "conflict", merge.stderr.strip()[:400])
-            )
+            set_aside.append(TrainResult(branch, "conflict", merge.stderr.strip()[:400]))
             continue
 
         built.append(branch)
@@ -564,19 +574,23 @@ def _build_candidate_group(
     return built, set_aside, head_shas
 
 
-def _land_batch_push(repo: Path, built: list[str]) -> list[TrainResult]:
+def _land_batch_push(repo: Path, built: list[str], protected: str = "main") -> list[TrainResult]:
     """Push mode: the candidate HEAD already carries every `built` member's
     merge commit in sequence, so one `git push` lands all of them at once."""
-    push = _git(repo, "push", "origin", "main", check=False)
+    push = _git(repo, "push", "origin", protected, check=False)
     if push.returncode != 0:
-        _git(repo, "reset", "--hard", "origin/main")
+        _git(repo, "reset", "--hard", f"origin/{protected}")
         detail = f"push failed: {push.stderr.strip()[:400]}"
         return [TrainResult(b, "error", detail) for b in built]
     return [TrainResult(b, "landed") for b in built]
 
 
 def _land_batch_pr_squash(
-    repo: Path, built: list[str], validated_tree: str, head_shas: dict[str, str]
+    repo: Path,
+    built: list[str],
+    validated_tree: str,
+    head_shas: dict[str, str],
+    protected: str = "main",
 ) -> list[TrainResult]:
     """pr-squash mode: land each member's PR one at a time, in queue order.
 
@@ -603,27 +617,25 @@ def _land_batch_pr_squash(
     gh = _gh_exe()
     results: list[TrainResult] = []
     for idx, branch in enumerate(built):
-        failure = _squash_one(repo, gh, branch, head_shas[branch])
+        failure = _squash_one(repo, gh, branch, head_shas[branch], protected)
         if failure is not None:
-            _git(repo, "reset", "--hard", "origin/main")
+            _git(repo, "reset", "--hard", f"origin/{protected}")
             results.append(failure)
             results.extend(
-                TrainResult(
-                    b, "rejected", f"batch landing halted: {branch} failed - re-queue"
-                )
+                TrainResult(b, "rejected", f"batch landing halted: {branch} failed - re-queue")
                 for b in built[idx + 1 :]
             )
             return results
         results.append(TrainResult(branch, "landed"))
 
     _git(repo, "fetch", "origin")
-    landed_tree = _git(repo, "rev-parse", "origin/main^{tree}").stdout.strip()
+    landed_tree = _git(repo, "rev-parse", f"origin/{protected}^{{tree}}").stdout.strip()
     if landed_tree != validated_tree:
         results[-1] = TrainResult(
             built[-1], "error", "batch landed but tree mismatch - INVESTIGATE"
         )
     else:
-        _git(repo, "reset", "--hard", "origin/main")
+        _git(repo, "reset", "--hard", f"origin/{protected}")
     return results
 
 
@@ -634,15 +646,14 @@ def _land_batch(
     head_shas: dict[str, str],
     land: str,
     dry_run: bool,
+    protected: str = "main",
 ) -> list[TrainResult]:
     if dry_run:
-        _git(repo, "reset", "--hard", "origin/main")
-        return [
-            TrainResult(b, "landed", "dry-run: validated, not pushed") for b in built
-        ]
+        _git(repo, "reset", "--hard", f"origin/{protected}")
+        return [TrainResult(b, "landed", "dry-run: validated, not pushed") for b in built]
     if land == "pr-squash":
-        return _land_batch_pr_squash(repo, built, tree, head_shas)
-    return _land_batch_push(repo, built)
+        return _land_batch_pr_squash(repo, built, tree, head_shas, protected)
+    return _land_batch_push(repo, built, protected)
 
 
 def _run_batch(
@@ -652,6 +663,7 @@ def _run_batch(
     dry_run: bool,
     gate_timeout: int,
     land: str,
+    protected: str = "main",
 ) -> list[TrainResult]:
     """Build a candidate from `group` (in order), gate it once, and on red
     bisect - bors-ng's O(failing x log N) strategy.
@@ -665,10 +677,10 @@ def _run_batch(
     gate/bisect decision, which is made purely on `built`.
     """
     _git(repo, "fetch", "origin", "--prune")
-    _git(repo, "checkout", "main")
-    _git(repo, "reset", "--hard", "origin/main")
+    _git(repo, "checkout", protected)
+    _git(repo, "reset", "--hard", f"origin/{protected}")
 
-    built, set_aside, head_shas = _build_candidate_group(repo, group)
+    built, set_aside, head_shas = _build_candidate_group(repo, group, protected)
     if not built:
         return set_aside
 
@@ -677,17 +689,17 @@ def _run_batch(
     gate_detail = _run_gate(repo, gate, gate_timeout, dry_run, key)
 
     if gate_detail is None:
-        return set_aside + _land_batch(repo, built, tree, head_shas, land, dry_run)
+        return set_aside + _land_batch(repo, built, tree, head_shas, land, dry_run, protected)
 
     # Red. A lone member is a normal rejection, not a further split - halving
     # a size-1 list forever would never terminate.
     if len(built) == 1:
-        _git(repo, "reset", "--hard", "origin/main")
+        _git(repo, "reset", "--hard", f"origin/{protected}")
         return set_aside + [TrainResult(built[0], "rejected", gate_detail)]
 
     mid = len(built) // 2
-    left_results = _run_batch(repo, built[:mid], gate, dry_run, gate_timeout, land)
-    right_results = _run_batch(repo, built[mid:], gate, dry_run, gate_timeout, land)
+    left_results = _run_batch(repo, built[:mid], gate, dry_run, gate_timeout, land, protected)
+    right_results = _run_batch(repo, built[mid:], gate, dry_run, gate_timeout, land, protected)
     return set_aside + left_results + right_results
 
 
@@ -707,25 +719,29 @@ def run_train(
     gate_timeout: int = GATE_TIMEOUT_DEFAULT,
     land: str = "push",
     batch: int = 1,
+    protected: str = "main",
+    priority_label: str = "train-priority",
 ) -> list[TrainResult]:
     repo = Path(repo).resolve()
     batch = max(1, batch)
     lock = _acquire_lock(repo)
     results: list[TrainResult] = []
     try:
-        queue = branches if branches is not None else candidates_from_gh(repo)
+        queue = (
+            branches
+            if branches is not None
+            else candidates_from_gh(repo, protected, priority_label)
+        )
         if batch <= 1:
             for branch in queue:
                 branch_gate = gate_factory(branch) if gate_factory else gate
                 try:
                     result = process_branch(
-                        repo, branch, branch_gate, dry_run, gate_timeout, land
+                        repo, branch, branch_gate, dry_run, gate_timeout, land, protected
                     )
                 except Exception as exc:  # noqa: BLE001 - one broken branch must not stall the queue
-                    result = TrainResult(
-                        branch, "error", f"{type(exc).__name__}: {exc}"
-                    )
-                    _git(repo, "reset", "--hard", "origin/main", check=False)
+                    result = TrainResult(branch, "error", f"{type(exc).__name__}: {exc}")
+                    _git(repo, "reset", "--hard", f"origin/{protected}", check=False)
                 results.append(result)
                 _log_result(result)
         else:
@@ -739,12 +755,12 @@ def run_train(
                 group_gate = gate_factory(group[0]) if gate_factory else gate
                 try:
                     group_results = _run_batch(
-                        repo, group, group_gate, dry_run, gate_timeout, land
+                        repo, group, group_gate, dry_run, gate_timeout, land, protected
                     )
                 except Exception as exc:  # noqa: BLE001 - one broken group must not stall the queue
                     detail = f"{type(exc).__name__}: {exc}"
                     group_results = [TrainResult(b, "error", detail) for b in group]
-                    _git(repo, "reset", "--hard", "origin/main", check=False)
+                    _git(repo, "reset", "--hard", f"origin/{protected}", check=False)
                 # _run_batch's internal set-aside/bisect order does not track
                 # queue order - re-sort into it here so the caller always
                 # sees results in the same order the branches were queued,
@@ -770,21 +786,32 @@ def main() -> int:
     run_parser.add_argument("--repo", type=Path, default=Path.cwd())
     run_parser.add_argument("--branch", action="append", default=None)
     run_parser.add_argument("--gate", type=str, default=None)
-    run_parser.add_argument("--gate-timeout", type=int, default=GATE_TIMEOUT_DEFAULT)
+    run_parser.add_argument("--gate-timeout", type=int, default=None)
     run_parser.add_argument("--land", choices=["push", "pr-squash"], default="push")
-    run_parser.add_argument("--batch", type=int, default=1)
+    run_parser.add_argument("--batch", type=int, default=None)
     run_parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    gate = shlex.split(args.gate) if args.gate else GATE_DEFAULT
+    cfg = load_config(args.repo)
+    if args.gate:
+        gate = shlex.split(args.gate)
+    elif cfg.gate_fast:
+        gate = shlex.split(cfg.gate_fast)
+    else:
+        gate = GATE_DEFAULT
+    gate_timeout = args.gate_timeout if args.gate_timeout is not None else cfg.gate_timeout
+    batch = args.batch if args.batch is not None else cfg.batch
+
     results = run_train(
         repo=args.repo,
         branches=args.branch,
         gate=gate,
         dry_run=args.dry_run,
-        gate_timeout=args.gate_timeout,
+        gate_timeout=gate_timeout,
         land=args.land,
-        batch=args.batch,
+        batch=batch,
+        protected=cfg.protected_branch,
+        priority_label=cfg.priority_label,
     )
     # rejected/conflict are NORMAL train outcomes (the queue did its job);
     # only a system error is a failing exit for cron/loop wrappers. Under

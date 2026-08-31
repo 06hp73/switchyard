@@ -6,10 +6,17 @@ a broken guard must not paralyze every session.
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 GUARD = Path(__file__).resolve().parents[1] / "tools" / "guards" / "git_guard.sh"
+
+# The EV4XL-SIM venv is the only Python 3.11+ interpreter available in this
+# environment (tomllib requires it); config_get.sh's `sy_cfg` shells out to a
+# bare `python3`, so PATH must put a working interpreter ahead of whatever
+# this process's own ambient PATH would otherwise resolve first.
+_VENV_BIN = "/Users/storslasken/Developer/EV4XL-SIM/.venv/bin"
 
 
 def run_guard(command: str, cwd: str = "/tmp") -> subprocess.CompletedProcess:
@@ -142,3 +149,39 @@ def test_fail_open_on_garbage_input():
         ["bash", str(GUARD)], input="not json", capture_output=True, text=True, timeout=10
     )
     assert result.returncode == 0
+
+
+def test_main_push_ban_uses_configured_product_remote_match(tmp_path):
+    # product_remote_match set in switchyard.toml replaces which origin
+    # substring means "the protected product repo": EV4SIM (blocked by the
+    # hardcoded default in every test above) becomes ALLOWED, and the newly
+    # named repo becomes the one that's blocked instead - proving the config
+    # value is actually read, not just tolerated.
+    config = tmp_path / "switchyard.toml"
+    config.write_text('[switchyard]\nproduct_remote_match = "06hp73/OTHER"\n')
+    env = {
+        **os.environ,
+        "PATH": _VENV_BIN + os.pathsep + os.environ.get("PATH", ""),
+        "SWITCHYARD_CONFIG": str(config),
+    }
+
+    ev4sim_repo = make_repo_with_origin(tmp_path, "ev4sim", "https://github.com/06hp73/EV4SIM.git")
+    payload = json.dumps(
+        {"tool_input": {"command": "git push origin main"}, "cwd": str(ev4sim_repo)}
+    )
+    allowed = subprocess.run(
+        ["bash", str(GUARD)], input=payload, capture_output=True, text=True, timeout=10, env=env
+    )
+    assert allowed.returncode == 0, (
+        f"EV4SIM should be allowed once the config points 'protected' elsewhere: {allowed.stderr}"
+    )
+
+    other_repo = make_repo_with_origin(tmp_path, "other", "https://github.com/06hp73/OTHER.git")
+    payload = json.dumps(
+        {"tool_input": {"command": "git push origin main"}, "cwd": str(other_repo)}
+    )
+    blocked = subprocess.run(
+        ["bash", str(GUARD)], input=payload, capture_output=True, text=True, timeout=10, env=env
+    )
+    assert blocked.returncode == 2, "OTHER is now the configured protected repo"
+    assert "train" in blocked.stderr

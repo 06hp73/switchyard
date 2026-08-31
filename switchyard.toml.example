@@ -1,0 +1,89 @@
+# Switchyard project config - example.
+#
+# Copy this file to `switchyard.toml` at your repo's git toplevel and
+# uncomment/edit whatever you need to change. Every key below is optional:
+# an absent file, an absent key, or a value equal to the default shown here
+# all behave identically - a config file only ever OVERRIDES a hardcoded
+# default, it never becomes required.
+#
+# Resolution order (first hit wins), see tools/lib/switchyard_config.py:
+#   1. $SWITCHYARD_CONFIG          - path to a toml file, used verbatim
+#   2. <git toplevel>/switchyard.toml
+#   3. ~/.config/switchyard/config.toml
+#   4. all defaults (this file's commented-out values)
+#
+# A config file with a typo never breaks the tools: an unknown key is
+# ignored with a warning on stderr, and malformed TOML falls back to
+# defaults with a warning - never a crash.
+
+[switchyard]
+
+# The branch the merge train writes to and the radar/WIP guards diff
+# against. Almost always "main"; set this if your repo's trunk has a
+# different name (e.g. "trunk", "master").
+# protected_branch = "main"
+
+# Substring identifying YOUR protected product repo's `origin` remote URL.
+# git_guard.sh's "no direct push to main" ban is scoped to repos whose
+# origin matches this - e.g. an org/repo slug like "myorg/myproduct". Leave
+# empty (the default) to keep the guard's own built-in default scope.
+# product_remote_match = ""
+
+# Interpreter used for gates/tools that shell out to Python. Defaults to
+# whichever interpreter is running the current tool.
+# python = "/usr/bin/python3"
+
+# Path to the merge train's own full clone ("the station") - see
+# tools/train/setup_station.sh. Informational until a future `switchyard
+# station` command reads it.
+# station = ""
+
+# Command line for the FAST gate (tools/train/merge_train.py's default
+# tier). Split on shell-like word boundaries (shlex), e.g.
+# "bash tools/train/gate.sh". Empty means "use the train's own
+# GATE_DEFAULT" - only takes effect when --gate is not passed on the CLI.
+# gate_fast = ""
+
+# Command line for the FULL gate (optimizer-math / high-risk branches).
+# Select it per-branch via merge_train.py's --gate flag; not chosen
+# automatically. See tools/train/gate_full.sh for this repo's own full tier.
+# gate_full = ""
+
+# Seconds before a gate run is killed (whole process group, not just the
+# direct child) and the branch is rejected as "timed out".
+# gate_timeout = 5400
+
+# wip_status.sh's live-track-count banner turns into "WIP CAP EXCEEDED"
+# above this many simultaneously live (unmerged, content-different)
+# branches.
+# wip_cap = 5
+
+# Branch name prefixes collision_radar.py and wip_status.sh treat as "a work
+# track" worth counting/scanning. A TOML array of strings, each including
+# its trailing "/".
+# live_prefixes = ["claude/", "fix/", "feat/"]
+
+# How many queued branches merge_train.py groups into one candidate tree
+# per gate run (bors-ng style bisection on red). 1 = today's one-branch-at-
+# a-time behavior.
+# batch = 1
+
+# GitHub PR label that sorts a candidate to the front of the queue, ahead of
+# plain FIFO-by-PR-number ordering (candidates_from_gh).
+# priority_label = "train-priority"
+
+# Age in days after which a dependency-bump PR is considered stale for the
+# (future) dependency-freshness check.
+# deps_age_days = 7
+
+# Desktop notification style for (future) long-running commands: "none" or
+# "macos".
+# notify = "none"
+
+# Where per-track worktrees live, for the (future) track-lifecycle commands
+# (`switchyard track new`, etc). Empty = not yet configured.
+# worktree_dir = ""
+
+# Branch name prefix `switchyard track new` (future) uses when creating a
+# track's branch.
+# branch_prefix = "claude/"

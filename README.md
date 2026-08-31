@@ -39,6 +39,8 @@ demonstrably is not (Leßenich et al.).
 | `tools/train/gate.sh`, `tools/train/gate_full.sh` | The gate definitions: `gate.sh` (fast tier, default) runs lint + fast suite + machine-local characterization goldens; `gate_full.sh` (full tier, select per-branch via `--gate` for branches touching optimizer math) additionally runs the analytic golden-master suite and the optimizer fuzz/superadditivity/certificate proofs the fast tier excludes. Both pin the tested tree to the station checkout via an import preflight. Adapt to your project. |
 | `tools/train/json_merge_driver.py` | Key-path 3-way merge for JSON catalogs (i18n): different keys merge automatically, same-key edits conflict loudly, structural collapses resolve toward *ours* wholesale — never corrupt JSON, never silent loss (empty dicts are leaves). |
 | `tools/train/setup_station.sh` | Creates the train's own full clone ("the station") — a separate clone, not a worktree, because the train must hold `main` at all times. |
+| `tools/lib/switchyard_config.py` | The project config layer: loads `switchyard.toml` (env var, repo-toplevel, or `~/.config/switchyard/`, in that order) into a `SwitchyardConfig`. Every field defaults to today's hardcoded behavior, so an absent file changes nothing; a broken one (malformed TOML, unknown key) warns on stderr and falls back to defaults rather than crashing. |
+| `tools/lib/config_get.sh` | Bash-side `sy_cfg <key> <default>` — lets the guards read one config value without paying a Python startup cost when no config file exists at all. |
 
 ## Wiring into a project (Claude Code)
 
@@ -52,7 +54,8 @@ demonstrably is not (Leßenich et al.).
 4. `bash tools/guards/setup_pueue.sh`, then `bash tools/train/setup_station.sh`.
 5. Land branches with
    `python3 tools/train/merge_train.py run --repo <station> [--branch NAME]`
-   (default candidates: open non-draft PRs against `main`, oldest first).
+   (default candidates: open non-draft PRs against `main`, priority-labeled
+   ones first, then oldest first by PR number).
    Exit codes: 0 = nothing errored (rejected/conflict are normal outcomes),
    1 = dry-run found a branch that would not land, 2 = a system error.
 
@@ -60,9 +63,38 @@ Convention that makes it all work: sessions open **draft** PRs while working
 and mark them **ready** to queue for the train; `main` is never pushed by
 anyone but the train.
 
+## Configuration
+
+Every tool works with zero config, using the hardcoded defaults this project
+shipped with. To override any of them, copy `switchyard.toml.example` to
+`switchyard.toml` and uncomment what you need:
+
+```bash
+cp switchyard.toml.example switchyard.toml
+```
+
+Resolution order (first hit wins) — see `tools/lib/switchyard_config.py`:
+
+1. `$SWITCHYARD_CONFIG` — path to a toml file, used verbatim.
+2. `<git toplevel>/switchyard.toml` — the config next to the repo it applies to.
+3. `~/.config/switchyard/config.toml` — a machine-wide fallback.
+4. All defaults, if none of the above exist.
+
+```toml
+[switchyard]
+protected_branch = "main"
+wip_cap = 8
+live_prefixes = ["claude/", "fix/", "feat/", "release/"]
+```
+
+An unknown key is ignored with a one-line warning on stderr (forward
+compatibility); malformed TOML falls back to defaults with a warning instead
+of crashing — a broken config must never brick a guard. See
+`switchyard.toml.example` for every key, its default, and what it controls.
+
 ## Tests
 
-47 tests, plain pytest, no project dependencies:
+78 tests, plain pytest, no project dependencies:
 
 ```bash
 python3 -m pytest tests/ -q
