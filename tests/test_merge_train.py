@@ -239,6 +239,153 @@ def test_corrupt_cache_quarantined_then_selfheals(tmp_path):
     assert len(counter.read_text().splitlines()) == 1
 
 
+FAKE_GH_BODY = """# Stub `gh` for the pr-squash landing tests - see write_fake_gh() below.
+import os
+import subprocess
+import sys
+import tempfile
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:2] == ["pr", "list"]:
+        pr_number = os.environ.get("FAKE_GH_PR_NUMBER", "")
+        if pr_number:
+            print(pr_number)
+        return 0
+    if args[:2] == ["pr", "merge"]:
+        if os.environ.get("FAKE_GH_MERGE_MODE", "ok") == "fail":
+            sys.stderr.write(os.environ.get("FAKE_GH_FAIL_MESSAGE", "merge blocked") + "\\n")
+            return 1
+        branch = os.environ["FAKE_GH_BRANCH"]
+        origin_url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        clone = tempfile.mkdtemp(prefix="fake-gh-clone-")
+        subprocess.run(["git", "clone", "-q", origin_url, clone], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", clone, "merge", "--squash", "origin/" + branch],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", clone, "commit", "-m", "squash merge " + branch],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", clone, "push", "-q", "origin", "main"], check=True, capture_output=True
+        )
+        return 0
+    sys.stderr.write("fake_gh stub: unhandled args " + repr(args) + "\\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""
+
+
+def write_fake_gh(tmp_path: Path) -> Path:
+    """Write the stub `gh` binary the pr-squash tests inject via SWITCHYARD_GH.
+
+    There is no live GitHub in these tests, so the mechanism is simplified:
+    real `gh pr merge --squash` lands the PR server-side via GitHub's API; the
+    stub instead clones the test's own bare `origin` fresh (cwd is the
+    station repo, so plain `git remote get-url origin` finds it), does a
+    plain `git merge --squash` of the target branch (named by $FAKE_GH_BRANCH
+    - a stand-in for what a real PR number would resolve to server-side) onto
+    that clone's main, commits, and pushes straight to origin/main. Base and
+    branch diff are identical to what process_branch's local --no-ff merge
+    already validated and there is no textual conflict in these fixtures, so
+    the resulting tree is bit-identical to the validated one - exactly the
+    invariant _land_via_pr_squash's post-merge tree check depends on.
+    """
+    script = tmp_path / "fake_gh.py"
+    script.write_text("#!" + sys.executable + "\n" + FAKE_GH_BODY)
+    script.chmod(0o755)
+    return script
+
+
+def test_pr_squash_lands_and_tree_matches(tmp_path, monkeypatch):
+    origin, station = make_world(tmp_path)
+    before = origin_main(origin)
+    fake_gh = write_fake_gh(tmp_path)
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv("FAKE_GH_PR_NUMBER", "1")
+    monkeypatch.setenv("FAKE_GH_MERGE_MODE", "ok")
+    monkeypatch.setenv("FAKE_GH_BRANCH", "claude/good")
+
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
+    )
+
+    assert results == [TrainResult(branch="claude/good", status="landed")]
+    assert origin_main(origin) != before
+    # Independent content check that the tree-verification is real, not a
+    # tautology: the squash landed through gh must carry both the unchanged
+    # base file and the branch's new file, byte for byte.
+    assert (station / "app.txt").read_text() == "v1\n"
+    assert (station / "good.txt").read_text() == "good change\n"
+
+
+def test_pr_squash_merge_rejected_leaves_main_unmoved(tmp_path, monkeypatch):
+    origin, station = make_world(tmp_path)
+    before = origin_main(origin)
+    fake_gh = write_fake_gh(tmp_path)
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv("FAKE_GH_PR_NUMBER", "7")
+    monkeypatch.setenv("FAKE_GH_MERGE_MODE", "fail")
+    monkeypatch.setenv("FAKE_GH_FAIL_MESSAGE", "required status checks have not been met")
+
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
+    )
+
+    assert results[0].status == "rejected"
+    assert "required status checks" in results[0].detail
+    assert origin_main(origin) == before
+
+
+def test_pr_squash_no_open_pr_is_error(tmp_path, monkeypatch):
+    origin, station = make_world(tmp_path)
+    before = origin_main(origin)
+    fake_gh = write_fake_gh(tmp_path)
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv("FAKE_GH_PR_NUMBER", "")  # stub's `pr list` prints nothing back
+
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
+    )
+
+    assert results[0].status == "error"
+    assert "no open PR" in results[0].detail
+    assert origin_main(origin) == before
+
+
+def test_pr_squash_tree_mismatch_is_loud_error(tmp_path, monkeypatch):
+    # Simulates gh landing something other than what was gate-tested (e.g.
+    # main moved between the local test and the real landing): point the
+    # stub at the WRONG branch, so what actually lands on origin/main cannot
+    # match the tree process_branch validated for "claude/good".
+    origin, station = make_world(tmp_path)
+    fake_gh = write_fake_gh(tmp_path)
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv("FAKE_GH_PR_NUMBER", "1")
+    monkeypatch.setenv("FAKE_GH_MERGE_MODE", "ok")
+    monkeypatch.setenv("FAKE_GH_BRANCH", "claude/bad")
+
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
+    )
+
+    assert results[0].status == "error"
+    assert "tree mismatch" in results[0].detail
+
+
 def test_cli_dry_run_red_exits_1(tmp_path):
     origin, station = make_world(tmp_path)
     cli = [sys.executable, str(MERGE_TRAIN_SCRIPT), "run", "--repo", str(station)]

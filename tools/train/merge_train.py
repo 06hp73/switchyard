@@ -1,12 +1,36 @@
 """The merge train: the only writer to main.
 
 One branch at a time: refresh main, replay-check, build the real merge, test
-the COMBINED tree, push only on green. A red branch is reported and skipped -
+the COMBINED tree, land only on green. A red branch is reported and skipped -
 it never blocks the branches behind it, and it never moves main.
 
 The train runs as a normal user process (never through a Claude session's
 Bash tool), so the session guard hooks do not apply to it - by design: the
 guards ban sessions from pushing main precisely because the train does it.
+
+Landing modes (--land):
+    push (default) - `git push origin main` directly once the combined tree
+        is gate-green. Correct when main has no server-side rule rejecting a
+        plain push (e.g. this repo's own main).
+    pr-squash - for a main that carries a GitHub ruleset (required status
+        checks, non-fast-forward) which rejects a direct push with GH013.
+        The local merge commit is still built and gate-tested exactly as in
+        push mode - a red branch is caught identically - but landing goes
+        through `gh pr merge <number> --squash` against the branch's open PR
+        instead of pushing. The branch's open PR is found via
+        `gh pr list --head <branch> --base main --state open`; no open PR is
+        a "no open PR for branch" error. After a successful gh merge, main
+        is re-fetched and `origin/main^{tree}` is checked against the tree
+        the gate just validated: squashing the same branch onto an unmoved
+        main must reproduce that exact tree, so a mismatch means main moved
+        (or something else is wrong) between the local test and the landing.
+        That is reported loudly as an error ("... tree mismatch -
+        INVESTIGATE") rather than silently trusted or rolled back. A gh
+        merge failure (for example required checks unmet) is a normal
+        rejected outcome for the queue, not a system error - main is reset
+        locally to origin/main and the branch is reported rejected with gh's
+        stderr tail. The `gh` executable name is read from the SWITCHYARD_GH
+        env var (default "gh") so tests can inject a stub.
 
 State (at the repo root):
     .train/validated_trees.txt  - cache keys (tree hash + gate argv, hashed)
@@ -16,14 +40,15 @@ State (at the repo root):
 
 Usage:
     python tools/train/merge_train.py run [--repo PATH] [--branch NAME ...]
-        [--gate CMD] [--gate-timeout SECONDS] [--dry-run]
+        [--gate CMD] [--gate-timeout SECONDS] [--land {push,pr-squash}]
+        [--dry-run]
 Without --branch, candidates come from
     gh pr list --state open --draft=false --base main
 ordered oldest first (FIFO by PR number).
 
 Exit codes: 0 nothing errored (rejected/conflict branches are a normal
 result, not a failure); 1 only under --dry-run, when some branch would not
-have landed; 2 a branch errored (bad gate binary, ghost branch, push
+have landed; 2 a branch errored (bad gate binary, ghost branch, landing
 failure - a system fault, not a normal red).
 """
 
@@ -145,10 +170,15 @@ def _record_key(repo: Path, key: str) -> None:
         f.write(key + "\n")
 
 
+def _gh_exe() -> str:
+    """The `gh` executable name/path - overridable so tests can inject a stub."""
+    return os.environ.get("SWITCHYARD_GH", "gh")
+
+
 def candidates_from_gh(repo: Path) -> list[str]:
     proc = subprocess.run(
         [
-            "gh",
+            _gh_exe(),
             "pr",
             "list",
             "--state",
@@ -172,8 +202,82 @@ def candidates_from_gh(repo: Path) -> list[str]:
     return [p["headRefName"] for p in prs]
 
 
+def _land_via_pr_squash(repo: Path, branch: str, validated_tree: str) -> TrainResult:
+    """Land the already gate-tested merge by squash-merging its PR through gh.
+
+    Required when main carries a GitHub ruleset (required status checks,
+    non-fast-forward) that rejects a direct `git push origin main` with
+    GH013. process_branch's local merge commit exists only to compute and
+    gate-test `validated_tree`; gh performs the actual landing server-side.
+    """
+    gh = _gh_exe()
+    pr_list = subprocess.run(
+        [
+            gh,
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--base",
+            "main",
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--limit",
+            "1",
+            "-q",
+            ".[0].number",
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if pr_list.returncode != 0:
+        _git(repo, "reset", "--hard", "origin/main")
+        return TrainResult(branch, "error", f"gh pr list failed: {pr_list.stderr.strip()[:400]}")
+
+    # `.[0].number` on an empty PR list is jq null, not an error - a "null" or
+    # blank stdout both mean the same thing here: no open PR to land through.
+    pr_number = pr_list.stdout.strip()
+    if not pr_number or pr_number == "null":
+        _git(repo, "reset", "--hard", "origin/main")
+        return TrainResult(branch, "error", f"no open PR for branch {branch}")
+
+    merge = subprocess.run(
+        [gh, "pr", "merge", pr_number, "--squash"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if merge.returncode != 0:
+        _git(repo, "reset", "--hard", "origin/main")
+        # Blocked by a ruleset (required checks unmet, etc.) is a normal red
+        # for the queue, not a system fault - same status class as a failed gate.
+        tail = (merge.stdout + merge.stderr).strip()[-2000:]
+        return TrainResult(branch, "rejected", f"gh pr merge failed:\n{tail}")
+
+    _git(repo, "fetch", "origin")
+    landed_tree = _git(repo, "rev-parse", "origin/main^{tree}").stdout.strip()
+    if landed_tree != validated_tree:
+        # main moved (or something else is wrong) between the local gate test
+        # and gh's landing. Loud and stop - no rollback attempt, main is
+        # already live and a guessed "fix" could make a real mess worse.
+        return TrainResult(branch, "error", "landed but tree mismatch - INVESTIGATE")
+
+    _git(repo, "reset", "--hard", "origin/main")
+    return TrainResult(branch, "landed")
+
+
 def process_branch(
-    repo: Path, branch: str, gate: list[str], dry_run: bool, gate_timeout: int
+    repo: Path,
+    branch: str,
+    gate: list[str],
+    dry_run: bool,
+    gate_timeout: int,
+    land: str = "push",
 ) -> TrainResult:
     _git(repo, "fetch", "origin", "--prune")
     _git(repo, "checkout", "main")
@@ -249,6 +353,9 @@ def process_branch(
         _git(repo, "reset", "--hard", "origin/main")
         return TrainResult(branch, "landed", "dry-run: validated, not pushed")
 
+    if land == "pr-squash":
+        return _land_via_pr_squash(repo, branch, tree)
+
     push = _git(repo, "push", "origin", "main", check=False)
     if push.returncode != 0:
         _git(repo, "reset", "--hard", "origin/main")
@@ -263,6 +370,7 @@ def run_train(
     gate_factory=None,
     dry_run: bool = False,
     gate_timeout: int = GATE_TIMEOUT_DEFAULT,
+    land: str = "push",
 ) -> list[TrainResult]:
     repo = Path(repo).resolve()
     lock = _acquire_lock(repo)
@@ -272,7 +380,7 @@ def run_train(
         for branch in queue:
             branch_gate = gate_factory(branch) if gate_factory else gate
             try:
-                result = process_branch(repo, branch, branch_gate, dry_run, gate_timeout)
+                result = process_branch(repo, branch, branch_gate, dry_run, gate_timeout, land)
             except Exception as exc:  # noqa: BLE001 - one broken branch must not stall the queue
                 result = TrainResult(branch, "error", f"{type(exc).__name__}: {exc}")
                 _git(repo, "reset", "--hard", "origin/main", check=False)
@@ -298,6 +406,7 @@ def main() -> int:
     run_parser.add_argument("--branch", action="append", default=None)
     run_parser.add_argument("--gate", type=str, default=None)
     run_parser.add_argument("--gate-timeout", type=int, default=GATE_TIMEOUT_DEFAULT)
+    run_parser.add_argument("--land", choices=["push", "pr-squash"], default="push")
     run_parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -308,6 +417,7 @@ def main() -> int:
         gate=gate,
         dry_run=args.dry_run,
         gate_timeout=args.gate_timeout,
+        land=args.land,
     )
     # rejected/conflict are NORMAL train outcomes (the queue did its job);
     # only a system error is a failing exit for cron/loop wrappers. Under
