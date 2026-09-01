@@ -136,12 +136,44 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from notify import notify as _send_notification  # noqa: E402
 from switchyard_config import load_config  # noqa: E402
 
 GATE_DEFAULT = ["bash", "tools/train/gate.sh"]
 GATE_TIMEOUT_DEFAULT = 5400
+
+
+def _notify_result(branch: str, result: TrainResult, notify_mode: str) -> None:
+    """Fire a short, best-effort desktop notification for one finalized
+    TrainResult - landed, rejected, error, or landed-via-flaky-retry (its
+    own distinct message, since "fine" and "fine, but go look at
+    flaky_log" are different signals worth telling apart at a glance).
+
+    `conflict` is deliberately excluded: with several parallel work tracks
+    it is an expected, frequent, not-actionable-mid-session outcome, and a
+    notification per collision would be noise, not signal.
+
+    Delegates to tools/lib/notify.py's notify(title, message, cfg), which
+    wants a cfg-shaped object (a `.notify` attribute). run_train() takes
+    `notify_mode` as a plain string, same as `protected`/`priority_label`/
+    etc (see the module docstring's "Config" paragraph - nothing below
+    main() touches a whole SwitchyardConfig), so it is wrapped here in a
+    throwaway namespace just to satisfy notify()'s own signature.
+    """
+    if result.status == "landed" and result.flaky:
+        title, message = "switchyard: flaky-landed", f"{branch} landed on retry - see flaky_log"
+    elif result.status == "landed":
+        title, message = "switchyard: landed", f"{branch} landed"
+    elif result.status == "rejected":
+        title, message = "switchyard: rejected", f"{branch} rejected"
+    elif result.status == "error":
+        title, message = "switchyard: error", f"{branch} errored - needs a look"
+    else:
+        return
+    _send_notification(title, message, SimpleNamespace(notify=notify_mode))
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -905,6 +937,7 @@ def run_train(
     protected: str = "main",
     priority_label: str = "train-priority",
     retry_flaky: bool = False,
+    notify_mode: str = "none",
 ) -> list[TrainResult]:
     repo = Path(repo).resolve()
     batch = max(1, batch)
@@ -936,6 +969,7 @@ def run_train(
                 results.append(result)
                 _log_result(result)
                 _append_history(repo, result)
+                _notify_result(branch, result, notify_mode)
         else:
             # gate_factory is inherently per-branch; a batch gates ONE
             # candidate tree for several branches at once, so there is no
@@ -965,6 +999,7 @@ def run_train(
                     results.append(result)
                     _log_result(result)
                     _append_history(repo, result)
+                    _notify_result(branch, result, notify_mode)
     finally:
         shutil.rmtree(lock, ignore_errors=True)
     counts: dict[str, int] = {}
@@ -1015,6 +1050,7 @@ def main() -> int:
         protected=cfg.protected_branch,
         priority_label=cfg.priority_label,
         retry_flaky=retry_flaky,
+        notify_mode=cfg.notify,
     )
     # rejected/conflict are NORMAL train outcomes (the queue did its job);
     # only a system error is a failing exit for cron/loop wrappers. Under

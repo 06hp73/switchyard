@@ -119,6 +119,25 @@ def test_status_survives_missing_train_dir_and_bad_repo_path(tmp_path):
     assert "Traceback" not in proc.stderr
 
 
+def test_status_defaults_to_notify_none(tmp_path):
+    origin, station = make_world(tmp_path)
+
+    proc = run_cli("status", "--repo", str(station), home=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "notify: none" in proc.stdout
+
+
+def test_status_shows_configured_notify_mode(tmp_path):
+    origin, station = make_world(tmp_path)
+    (station / "switchyard.toml").write_text('[switchyard]\nnotify = "macos"\n')
+
+    proc = run_cli("status", "--repo", str(station), home=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "notify: macos" in proc.stdout
+
+
 # --- switchyard stats ---------------------------------------------------------
 
 

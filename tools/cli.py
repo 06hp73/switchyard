@@ -2,11 +2,13 @@
 
 Subcommands:
     switchyard status [--repo PATH]
-        One composed, read-only terminal view: WIP (live tracks vs the
-        configured cap), RADAR (conflict pairs), QUEUE (open PRs via gh,
-        ready vs draft, priority-labeled marked), FLAKY (.train/flaky_log.jsonl,
-        if present - a log another tool may start writing; this only ever
-        reads it), LAST LANDINGS (the tail of .train/history.jsonl,
+        A `notify: <mode>` line (SwitchyardConfig.notify, see
+        tools/lib/notify.py) followed by one composed, read-only terminal
+        view: WIP (live tracks vs the configured cap), RADAR (conflict
+        pairs), QUEUE (open PRs via gh, ready vs draft, priority-labeled
+        marked), FLAKY (.train/flaky_log.jsonl - process_branch's retry-
+        rescued gates, see merge_train.py's _append_flaky_log; this only
+        ever reads it), LAST LANDINGS (the tail of .train/history.jsonl,
         humanized). Every section is independently defensive: a missing
         file, an absent `gh`, or an unreadable repo degrades that ONE
         section to a one-line explanation and never takes the rest of the
@@ -163,9 +165,10 @@ def _print_queue_section(repo: Path, cfg) -> None:
 
 
 def _print_flaky_section(repo: Path) -> None:
-    # Forward-compat: no tool in this repo writes .train/flaky_log.jsonl yet.
-    # This only ever reads it, defensively, and renders whatever is there so
-    # a future flaky-test tracker needs no changes here to show up.
+    # merge_train.py's process_branch writes one line here per gate that
+    # failed then passed on an identical immediate retry (see
+    # _append_flaky_log) - this only ever reads it, defensively, and renders
+    # whatever is there.
     entries = _read_jsonl(repo / ".train" / "flaky_log.jsonl")
     if entries is None:
         print("  no flaky log yet (.train/flaky_log.jsonl not present)")
@@ -206,6 +209,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     repo = args.repo.resolve()
     cfg = load_config(repo)
 
+    print(f"notify: {cfg.notify}")
+    print()
     print("== WIP ==")
     _print_wip_section(repo, cfg)
     print()

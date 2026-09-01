@@ -924,3 +924,128 @@ def test_batch_red_bisection_count_unaffected_by_retry_flaky(tmp_path):
 
     assert [r.status for r in results] == ["landed", "rejected"]
     assert len(counter.read_text().splitlines()) == 3  # AB, A, B - unchanged from batch=2 alone
+
+
+# --- notifications (opt-in, cfg.notify -> run_train(notify_mode=...)) -------
+#
+# tools/lib/notify.py's own backend behavior (osascript argv, "none" firing
+# no subprocess at all) is covered in tests/test_notify.py; these tests only
+# check that run_train actually calls it, for the right outcomes, with the
+# right mode - by monkeypatching the module-level _send_notification name
+# merge_train.py's _notify_result calls, never the real notify() backend.
+
+
+def test_run_train_notifies_on_landed_and_rejected(tmp_path, monkeypatch):
+    import merge_train
+
+    calls = []
+    monkeypatch.setattr(
+        merge_train,
+        "_send_notification",
+        lambda title, message, cfg: calls.append((title, message, cfg.notify)),
+    )
+
+    origin, station = make_world(tmp_path)
+    run_train(
+        repo=station,
+        branches=["claude/bad", "claude/good"],
+        gate=None,
+        gate_factory=lambda branch: (
+            ["/usr/bin/false"] if branch == "claude/bad" else ["/usr/bin/true"]
+        ),
+        notify_mode="macos",
+    )
+
+    assert len(calls) == 2
+    rejected_title, rejected_message, rejected_mode = calls[0]
+    landed_title, landed_message, landed_mode = calls[1]
+    assert rejected_mode == landed_mode == "macos"
+    assert "rejected" in (rejected_title + rejected_message).lower()
+    assert "landed" in (landed_title + landed_message).lower()
+
+
+def test_run_train_notifies_on_error(tmp_path, monkeypatch):
+    import merge_train
+
+    calls = []
+    monkeypatch.setattr(
+        merge_train, "_send_notification", lambda title, message, cfg: calls.append(title)
+    )
+
+    origin, station = make_world(tmp_path)
+    run_train(repo=station, branches=["claude/ghost"], gate=["/usr/bin/true"], notify_mode="macos")
+
+    assert len(calls) == 1
+    assert "error" in calls[0].lower()
+
+
+def test_run_train_does_not_notify_on_conflict(tmp_path, monkeypatch):
+    import merge_train
+
+    calls = []
+    monkeypatch.setattr(
+        merge_train, "_send_notification", lambda title, message, cfg: calls.append(title)
+    )
+
+    origin, station = make_world(tmp_path)
+    seed = tmp_path / "seed"
+    git(seed, "checkout", "main")
+    (seed / "app.txt").write_text("main moved\n")
+    git(seed, "commit", "-am", "main change")
+    git(seed, "push", "origin", "main")
+    git(seed, "checkout", "-b", "claude/clash", "HEAD~1")
+    (seed / "app.txt").write_text("branch clash\n")
+    git(seed, "commit", "-am", "clash")
+    git(seed, "push", "origin", "claude/clash")
+
+    run_train(repo=station, branches=["claude/clash"], gate=["/usr/bin/true"], notify_mode="macos")
+
+    assert calls == []
+
+
+def test_run_train_flaky_landed_gets_a_distinct_notification(tmp_path, monkeypatch):
+    import merge_train
+
+    calls = []
+    monkeypatch.setattr(
+        merge_train,
+        "_send_notification",
+        lambda title, message, cfg: calls.append(title + " " + message),
+    )
+
+    origin, station = make_world(tmp_path)
+    counter = tmp_path / "count"
+    gate = [
+        "/bin/sh",
+        "-c",
+        f"test -f {counter} && ec=0 || ec=1; echo x >> {counter}; exit $ec",
+    ]
+
+    run_train(
+        repo=station,
+        branches=["claude/good"],
+        gate=gate,
+        retry_flaky=True,
+        notify_mode="macos",
+    )
+
+    assert len(calls) == 1
+    assert "flaky" in calls[0].lower()
+
+
+def test_default_notify_mode_is_none(tmp_path, monkeypatch):
+    # run_train()'s own default (notify_mode="none") must be a no-op for
+    # every caller that predates this feature. test_notify.py separately
+    # proves notify() itself never shells out for "none" - this proves the
+    # default actually reaches it, unchanged, end to end.
+    import merge_train
+
+    calls = []
+    monkeypatch.setattr(
+        merge_train, "_send_notification", lambda title, message, cfg: calls.append(cfg.notify)
+    )
+
+    origin, station = make_world(tmp_path)
+    run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"])
+
+    assert calls == ["none"]
