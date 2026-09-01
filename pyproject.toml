@@ -1,2 +1,8 @@
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+# PLW1510: subprocess.run() must state `check=` explicitly rather than rely
+# on its silently-False default - a hygiene pass (2026-09) audited every
+# call site under tools/ and tests/ and made the choice explicit everywhere.
+extend-select = ["PLW1510"]

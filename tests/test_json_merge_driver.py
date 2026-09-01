@@ -26,7 +26,10 @@ def merge(tmp_path: Path, base: dict, ours: dict, theirs: dict) -> tuple[int, st
         p.write_text(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
         paths.append(p)
     proc = subprocess.run(
-        [sys.executable, str(DRIVER), *map(str, paths)], capture_output=True, text=True
+        [sys.executable, str(DRIVER), *map(str, paths)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return proc.returncode, paths[1].read_text()
 
@@ -39,7 +42,10 @@ def merge_full(tmp_path: Path, base: dict, ours: dict, theirs: dict) -> tuple[in
         p.write_text(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
         paths.append(p)
     proc = subprocess.run(
-        [sys.executable, str(DRIVER), *map(str, paths)], capture_output=True, text=True
+        [sys.executable, str(DRIVER), *map(str, paths)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return proc.returncode, paths[1].read_text(), proc.stderr
 

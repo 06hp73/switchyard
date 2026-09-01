@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "lib"))
 
-from notify import notify  # noqa: E402
+from notify import notify
 
 
 def test_none_mode_never_calls_subprocess(monkeypatch):

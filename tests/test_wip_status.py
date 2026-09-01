@@ -45,6 +45,7 @@ def run_wip_status(repo: Path) -> str:
         text=True,
         env={**ENV, "HOME": str(repo)},
         timeout=10,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr
     return proc.stdout.strip()
@@ -105,6 +106,7 @@ def test_wip_cap_configurable_via_switchyard_toml(tmp_path):
             "SWITCHYARD_CONFIG": str(config),
         },
         timeout=10,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr
     # cap=2 with exactly 2 live branches is AT the cap, not exceeding it - a

@@ -35,7 +35,9 @@ def git(cwd: Path, *args: str) -> str:
 
 
 def git_ok(cwd: Path, *args: str) -> bool:
-    proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=ENV)
+    proc = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True, env=ENV, check=False
+    )
     return proc.returncode == 0
 
 
@@ -66,6 +68,7 @@ def run_cli(
         text=True,
         env=env,
         timeout=timeout,
+        check=False,
     )
 
 

@@ -13,6 +13,7 @@ def run_alloc(worktree_name: str) -> dict[str, str]:
         capture_output=True,
         text=True,
         timeout=10,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     out: dict[str, str] = {}

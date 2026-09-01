@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "lib"))
 
-from switchyard_config import SwitchyardConfig, dump_effective, load_config  # noqa: E402
+from switchyard_config import SwitchyardConfig, dump_effective, load_config
 
 
 def test_defaults_when_nothing_configured(tmp_path, monkeypatch):
@@ -186,6 +186,7 @@ def run_cli(key: str, default: str, env: dict) -> subprocess.CompletedProcess:
         text=True,
         env=env,
         timeout=10,
+        check=False,
     )
 
 

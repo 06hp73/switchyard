@@ -73,9 +73,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "train"))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "radar"))
-import collision_radar  # noqa: E402
-import merge_train  # noqa: E402
-from switchyard_config import load_config  # noqa: E402
+import collision_radar
+import merge_train
+from switchyard_config import load_config
 
 DEFAULT_STATS_DAYS = 14
 
@@ -166,6 +166,7 @@ def _print_queue_section(repo: Path, cfg) -> None:
             text=True,
             cwd=repo,
             timeout=30,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         print("  gh unavailable")
@@ -362,6 +363,7 @@ def _find_worktree_for_branch(repo: Path, branch: str) -> Path | None:
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if proc.returncode != 0:
         return None
@@ -408,6 +410,7 @@ def cmd_track_new(args: argparse.Namespace) -> int:
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if add.returncode != 0:
         print(f"switchyard track new: could not create branch/worktree: {add.stderr.strip()}")
@@ -417,6 +420,7 @@ def cmd_track_new(args: argparse.Namespace) -> int:
         ["git", "-C", str(repo), "push", "-u", "origin", branch],
         capture_output=True,
         text=True,
+        check=False,
     )
     if push.returncode != 0:
         print(
@@ -445,7 +449,9 @@ def cmd_track_new(args: argparse.Namespace) -> int:
         cfg.protected_branch,
     ]
     try:
-        pr = subprocess.run(gh_create, capture_output=True, text=True, cwd=repo, timeout=60)
+        pr = subprocess.run(
+            gh_create, capture_output=True, text=True, cwd=repo, timeout=60, check=False
+        )
         gh_ok = pr.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         gh_ok = False
@@ -493,6 +499,7 @@ def cmd_track_done(args: argparse.Namespace) -> int:
                 text=True,
                 cwd=repo,
                 timeout=30,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(
@@ -526,6 +533,7 @@ def cmd_track_done(args: argparse.Namespace) -> int:
             ["git", "-C", str(repo), "worktree", "remove", str(worktree_path)],
             capture_output=True,
             text=True,
+            check=False,
         )
         if remove.returncode != 0:
             print(f"switchyard track done: worktree remove refused: {remove.stderr.strip()}")
@@ -540,6 +548,7 @@ def cmd_track_done(args: argparse.Namespace) -> int:
         ["git", "-C", str(repo), "branch", "-D", branch],
         capture_output=True,
         text=True,
+        check=False,
     )
     if delete_local.returncode != 0:
         print(
@@ -551,6 +560,7 @@ def cmd_track_done(args: argparse.Namespace) -> int:
         ["git", "-C", str(repo), "push", "origin", "--delete", branch],
         capture_output=True,
         text=True,
+        check=False,
     )
     if delete_remote.returncode != 0:
         print(
@@ -649,7 +659,10 @@ def cmd_watch_install(args: argparse.Namespace) -> int:
     print(f"wrote {plist_path}")
 
     load = subprocess.run(
-        ["launchctl", "load", "-w", str(plist_path)], capture_output=True, text=True
+        ["launchctl", "load", "-w", str(plist_path)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if load.returncode == 0:
         print(f"loaded via launchctl - runs `switchyard land` every {args.interval}s")
@@ -674,7 +687,10 @@ def cmd_watch_uninstall(args: argparse.Namespace) -> int:
         return 0
 
     unload = subprocess.run(
-        ["launchctl", "unload", "-w", str(plist_path)], capture_output=True, text=True
+        ["launchctl", "unload", "-w", str(plist_path)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if unload.returncode != 0:
         print(f"launchctl unload skipped/failed (tolerated): {unload.stderr.strip()}")
@@ -698,7 +714,10 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
 
     print(f"plist present: {plist_path}")
     proc = subprocess.run(
-        ["launchctl", "list", _watch_label(reponame)], capture_output=True, text=True
+        ["launchctl", "list", _watch_label(reponame)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if proc.returncode == 0:
         print("loaded in launchctl:")
@@ -729,7 +748,10 @@ def cmd_propose_revert(args: argparse.Namespace) -> int:
     sha = args.sha
 
     fetch = subprocess.run(
-        ["git", "-C", str(repo), "fetch", "origin", "--prune"], capture_output=True, text=True
+        ["git", "-C", str(repo), "fetch", "origin", "--prune"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if fetch.returncode != 0:
         print(f"switchyard propose-revert: git fetch failed: {fetch.stderr.strip()}")
@@ -741,6 +763,7 @@ def cmd_propose_revert(args: argparse.Namespace) -> int:
         ["git", "-C", str(repo), "log", "-1", "--format=%s", sha],
         capture_output=True,
         text=True,
+        check=False,
     )
     subject = subject_proc.stdout.strip()
     if subject_proc.returncode != 0 or not subject:
@@ -756,6 +779,7 @@ def cmd_propose_revert(args: argparse.Namespace) -> int:
         ["git", "-C", str(repo), "checkout", "-B", branch, f"origin/{protected}"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if checkout.returncode != 0:
         print(
@@ -768,15 +792,22 @@ def cmd_propose_revert(args: argparse.Namespace) -> int:
         ["git", "-C", str(repo), "revert", "--no-edit", sha],
         capture_output=True,
         text=True,
+        check=False,
     )
     if revert.returncode != 0:
         # Clean up completely rather than leave a half-reverted branch lying
         # around: abort the in-progress revert, return to `protected`, and
         # delete the branch this attempt created - nothing pushed yet, so
         # there is nothing remote to undo.
-        subprocess.run(["git", "-C", str(repo), "revert", "--abort"], capture_output=True)
-        subprocess.run(["git", "-C", str(repo), "checkout", protected], capture_output=True)
-        subprocess.run(["git", "-C", str(repo), "branch", "-D", branch], capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "revert", "--abort"], capture_output=True, check=False
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", protected], capture_output=True, check=False
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "-D", branch], capture_output=True, check=False
+        )
         print(
             f"switchyard propose-revert: revert of {sha} conflicts - cleaned up, "
             f"no branch left behind. Resolve by hand:\n{revert.stderr.strip()[:400]}"
@@ -784,7 +815,10 @@ def cmd_propose_revert(args: argparse.Namespace) -> int:
         return 2
 
     push = subprocess.run(
-        ["git", "-C", str(repo), "push", "-u", "origin", branch], capture_output=True, text=True
+        ["git", "-C", str(repo), "push", "-u", "origin", branch],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if push.returncode != 0:
         print(f"switchyard propose-revert: push failed (branch still local): {push.stderr.strip()}")
@@ -792,7 +826,9 @@ def cmd_propose_revert(args: argparse.Namespace) -> int:
 
     # Back to a clean, known baseline - same convention merge_train.py's
     # process_branch always follows after it is done with a branch.
-    subprocess.run(["git", "-C", str(repo), "checkout", protected], capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", protected], capture_output=True, check=False
+    )
 
     reason_text = ""
     if args.reason:
@@ -830,7 +866,9 @@ def cmd_propose_revert(args: argparse.Namespace) -> int:
         protected,
     ]
     try:
-        pr = subprocess.run(gh_create, capture_output=True, text=True, cwd=repo, timeout=60)
+        pr = subprocess.run(
+            gh_create, capture_output=True, text=True, cwd=repo, timeout=60, check=False
+        )
         gh_ok = pr.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         gh_ok = False

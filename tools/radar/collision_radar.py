@@ -18,14 +18,18 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from switchyard_config import load_config  # noqa: E402
+from switchyard_config import load_config
 
 LIVE_PREFIXES = ("claude/", "fix/", "feat/")
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
 
 

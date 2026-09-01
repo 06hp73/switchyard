@@ -35,6 +35,7 @@ def _notify_macos(title: str, message: str) -> None:
             ["osascript", "-e", script],
             capture_output=True,
             timeout=10,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         pass  # best-effort: a missing/hung osascript must never break the caller

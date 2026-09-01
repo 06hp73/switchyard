@@ -39,6 +39,7 @@ def git_ok(cwd: Path, *args: str) -> bool:
         capture_output=True,
         text=True,
         env=ENV,
+        check=False,
     )
     return proc.returncode == 0
 
@@ -71,6 +72,7 @@ def run_cli(*args: str, home: Path, timeout: int = 30) -> subprocess.CompletedPr
         text=True,
         env={**ENV, "HOME": str(home)},
         timeout=timeout,
+        check=False,
     )
 
 

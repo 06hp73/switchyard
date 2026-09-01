@@ -22,7 +22,12 @@ _VENV_BIN = "/Users/storslasken/Developer/EV4XL-SIM/.venv/bin"
 def run_guard(command: str, cwd: str = "/tmp") -> subprocess.CompletedProcess:
     payload = json.dumps({"tool_input": {"command": command}, "cwd": cwd})
     return subprocess.run(
-        ["bash", str(GUARD)], input=payload, capture_output=True, text=True, timeout=10
+        ["bash", str(GUARD)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
     )
 
 
@@ -146,7 +151,12 @@ def test_allows_ordinary_commands():
 
 def test_fail_open_on_garbage_input():
     result = subprocess.run(
-        ["bash", str(GUARD)], input="not json", capture_output=True, text=True, timeout=10
+        ["bash", str(GUARD)],
+        input="not json",
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
     )
     assert result.returncode == 0
 
@@ -170,7 +180,13 @@ def test_main_push_ban_uses_configured_product_remote_match(tmp_path):
         {"tool_input": {"command": "git push origin main"}, "cwd": str(ev4sim_repo)}
     )
     allowed = subprocess.run(
-        ["bash", str(GUARD)], input=payload, capture_output=True, text=True, timeout=10, env=env
+        ["bash", str(GUARD)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        check=False,
     )
     assert allowed.returncode == 0, (
         f"EV4SIM should be allowed once the config points 'protected' elsewhere: {allowed.stderr}"
@@ -181,7 +197,13 @@ def test_main_push_ban_uses_configured_product_remote_match(tmp_path):
         {"tool_input": {"command": "git push origin main"}, "cwd": str(other_repo)}
     )
     blocked = subprocess.run(
-        ["bash", str(GUARD)], input=payload, capture_output=True, text=True, timeout=10, env=env
+        ["bash", str(GUARD)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        check=False,
     )
     assert blocked.returncode == 2, "OTHER is now the configured protected repo"
     assert "train" in blocked.stderr

@@ -546,6 +546,7 @@ def test_cli_dry_run_red_exits_1(tmp_path):
         [*cli, "--branch", "claude/bad", "--gate", "/usr/bin/false", "--dry-run"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert dry_run.returncode == 1, dry_run.stderr
 
@@ -554,6 +555,7 @@ def test_cli_dry_run_red_exits_1(tmp_path):
         [*cli, "--branch", "claude/bad", "--gate", "/usr/bin/false"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert real_run.returncode == 0, real_run.stderr
 
@@ -731,6 +733,7 @@ def test_train_respects_config_gate_fast_and_batch_via_switchyard_toml(tmp_path)
         capture_output=True,
         text=True,
         env={**os.environ, "SWITCHYARD_CONFIG": str(config)},
+        check=False,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -881,6 +884,7 @@ def test_no_retry_flaky_cli_flag_runs_gate_only_once(tmp_path):
         capture_output=True,
         text=True,
         env={**os.environ, "SWITCHYARD_CONFIG": str(config)},
+        check=False,
     )
 
     assert proc.returncode == 0, proc.stderr  # a rejected branch is a normal outcome

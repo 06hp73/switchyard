@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "radar"))
 
-from collision_radar import live_branches, scan  # noqa: E402  (path set up above)
+from collision_radar import live_branches, scan
 
 
 def git(repo: Path, *args: str) -> None:

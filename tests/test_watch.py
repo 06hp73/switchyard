@@ -56,6 +56,7 @@ def run_cli(*args: str, home: Path, timeout: int = 30) -> subprocess.CompletedPr
         text=True,
         env={**ENV, "HOME": str(home)},
         timeout=timeout,
+        check=False,
     )
 
 

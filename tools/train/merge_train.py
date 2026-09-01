@@ -139,8 +139,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from notify import notify as _send_notification  # noqa: E402
-from switchyard_config import load_config  # noqa: E402
+from notify import notify as _send_notification
+from switchyard_config import load_config
 
 GATE_DEFAULT = ["bash", "tools/train/gate.sh"]
 GATE_TIMEOUT_DEFAULT = 5400
@@ -202,7 +202,11 @@ class TrainResult:
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=600
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
     )
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
@@ -320,6 +324,7 @@ def candidates_from_gh(
         text=True,
         cwd=repo,
         timeout=60,
+        check=False,
     )
     if proc.returncode != 0:
         raise SystemExit(f"gh pr list failed: {proc.stderr.strip()}")
@@ -386,6 +391,7 @@ def _squash_one(
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
     if pr_list.returncode != 0:
         return TrainResult(branch, "error", f"gh pr list failed: {pr_list.stderr.strip()[:400]}")
@@ -402,6 +408,7 @@ def _squash_one(
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     if merge.returncode != 0:
         # Blocked by a ruleset (required checks unmet, etc.) is a normal red
