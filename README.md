@@ -83,6 +83,7 @@ bin/switchyard track done <name>         # verify the PR merged (or --force-loca
 bin/switchyard watch install             # opt-in launchd agent: periodic `land` (macOS, off by default)
 bin/switchyard watch uninstall           # unload + remove that agent
 bin/switchyard watch status              # is it installed, is it loaded
+bin/switchyard propose-revert <sha>      # branch + draft PR that reverts <sha> - proposes only, never lands it
 ```
 
 `status` and `stats` are read-only and safe to run anytime, including
@@ -113,6 +114,18 @@ would. It refuses with a clear message if `station` is unset in
 what it would do (the plist XML for `install`, the unload/remove actions
 for `uninstall`) without touching `launchctl` or the filesystem. Nothing
 installs this automatically; it is opt-in only.
+
+`propose-revert <sha>` fetches, branches `revert-<sha7>` off the protected
+branch's tip, runs `git revert --no-edit <sha>`, pushes it, and (if `gh` is
+available) opens it as a **draft** pull request — `--reason FILE`'s content,
+if given, is embedded verbatim as fenced data under an "Automated failure
+context" heading, never interpreted. Owner policy: this command proposes a
+revert, it never lands one — it never marks the PR ready and never merges
+it, so an automated failure-triage flow can call it safely without any risk
+of an unattended revert reaching `main` on its own. A revert that conflicts
+aborts cleanly and leaves no branch behind (exit 2); without `gh`, the
+branch is still pushed and the `gh pr create` command is printed to run by
+hand.
 
 ## Configuration
 
@@ -145,7 +158,7 @@ of crashing — a broken config must never brick a guard. See
 
 ## Tests
 
-98 tests, plain pytest, no project dependencies (needs Python 3.11+ for
+129 tests, plain pytest, no project dependencies (needs Python 3.11+ for
 `tomllib` — see `tools/lib/switchyard_config.py`):
 
 ```bash

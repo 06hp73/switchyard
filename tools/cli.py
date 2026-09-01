@@ -44,6 +44,18 @@ Subcommands:
         `--dry-run` to print what it would do (the plist XML for `install`,
         the unload+remove actions for `uninstall`) without touching
         launchctl or the filesystem. See cmd_watch_install below.
+
+    switchyard propose-revert <sha> [--repo PATH] [--reason FILE]
+        Owner policy: propose, never auto-land. Fetches, branches
+        `revert-<sha7>` off the protected branch's tip, runs `git revert
+        --no-edit <sha>`, pushes it, and (if `gh` is available) opens it as
+        a DRAFT pull request - `--reason FILE`'s content, if given, is
+        embedded verbatim as fenced data (never interpreted) under an
+        "Automated failure context" heading. A revert conflict aborts
+        cleanly and leaves no branch behind (exit 2). Without `gh`, the
+        branch is still pushed and the `gh pr create` command is printed to
+        run by hand. This command never marks the PR ready and never merges
+        it - see cmd_propose_revert below.
 """
 
 from __future__ import annotations
@@ -696,6 +708,146 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- switchyard propose-revert: propose, never auto-land -----------------------
+
+
+def cmd_propose_revert(args: argparse.Namespace) -> int:
+    """Build a revert of `args.sha` on its own branch and open it as a draft PR.
+
+    Owner policy: this command PROPOSES a revert, it never lands one. A
+    successful run gets exactly as far as a pushed branch and (best-effort)
+    a draft PR - it never marks that PR ready and never merges it. The
+    actual decision to revert something stays a human act, same as
+    quarantining a flaky test does in the retry-once feature above: this
+    command's whole job is handing over the evidence (a real, tested revert
+    branch, plus whatever --reason file explains why) as fast as possible,
+    not making the call.
+    """
+    repo = args.repo.resolve()
+    cfg = load_config(repo)
+    protected = cfg.protected_branch
+    sha = args.sha
+
+    fetch = subprocess.run(
+        ["git", "-C", str(repo), "fetch", "origin", "--prune"], capture_output=True, text=True
+    )
+    if fetch.returncode != 0:
+        print(f"switchyard propose-revert: git fetch failed: {fetch.stderr.strip()}")
+        return 2
+
+    # Resolved before anything is created, so a bad/unknown sha fails fast
+    # without leaving a half-built branch behind.
+    subject_proc = subprocess.run(
+        ["git", "-C", str(repo), "log", "-1", "--format=%s", sha],
+        capture_output=True,
+        text=True,
+    )
+    subject = subject_proc.stdout.strip()
+    if subject_proc.returncode != 0 or not subject:
+        print(f"switchyard propose-revert: could not resolve {sha}: {subject_proc.stderr.strip()}")
+        return 2
+
+    branch = f"revert-{sha[:7]}"
+
+    # -B (not -b): resets `branch` to origin/<protected>'s tip even if a
+    # same-named branch is already sitting around from a previous attempt,
+    # so this command is safely re-runnable without a manual cleanup first.
+    checkout = subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-B", branch, f"origin/{protected}"],
+        capture_output=True,
+        text=True,
+    )
+    if checkout.returncode != 0:
+        print(
+            f"switchyard propose-revert: could not create branch {branch}: "
+            f"{checkout.stderr.strip()}"
+        )
+        return 2
+
+    revert = subprocess.run(
+        ["git", "-C", str(repo), "revert", "--no-edit", sha],
+        capture_output=True,
+        text=True,
+    )
+    if revert.returncode != 0:
+        # Clean up completely rather than leave a half-reverted branch lying
+        # around: abort the in-progress revert, return to `protected`, and
+        # delete the branch this attempt created - nothing pushed yet, so
+        # there is nothing remote to undo.
+        subprocess.run(["git", "-C", str(repo), "revert", "--abort"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "checkout", protected], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "branch", "-D", branch], capture_output=True)
+        print(
+            f"switchyard propose-revert: revert of {sha} conflicts - cleaned up, "
+            f"no branch left behind. Resolve by hand:\n{revert.stderr.strip()[:400]}"
+        )
+        return 2
+
+    push = subprocess.run(
+        ["git", "-C", str(repo), "push", "-u", "origin", branch], capture_output=True, text=True
+    )
+    if push.returncode != 0:
+        print(f"switchyard propose-revert: push failed (branch still local): {push.stderr.strip()}")
+        return 2
+
+    # Back to a clean, known baseline - same convention merge_train.py's
+    # process_branch always follows after it is done with a branch.
+    subprocess.run(["git", "-C", str(repo), "checkout", protected], capture_output=True)
+
+    reason_text = ""
+    if args.reason:
+        try:
+            reason_text = Path(args.reason).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(
+                f"switchyard propose-revert: could not read --reason file ({exc}) - "
+                "continuing without it"
+            )
+
+    pr_title = f"revert: {subject}"
+    body_parts = [f"Reverts {sha} (`{subject}`)."]
+    if reason_text:
+        # The file's content is untrusted DATA, never instructions to gh or
+        # to whoever reads the PR next - fenced verbatim, clearly labeled,
+        # never interpolated into the title or interpreted in any way.
+        body_parts.append("Automated failure context:\n```\n" + reason_text + "\n```")
+    body_parts.append("Proposed by switchyard; a human decides.")
+    pr_body = "\n\n".join(body_parts)
+
+    gh = merge_train._gh_exe()
+    gh_create = [
+        gh,
+        "pr",
+        "create",
+        "--title",
+        pr_title,
+        "--draft",
+        "--body",
+        pr_body,
+        "--head",
+        branch,
+        "--base",
+        protected,
+    ]
+    try:
+        pr = subprocess.run(gh_create, capture_output=True, text=True, cwd=repo, timeout=60)
+        gh_ok = pr.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        gh_ok = False
+
+    print(f"branch pushed: {branch}")
+    if gh_ok:
+        print("draft PR opened - proposed by switchyard, a human decides whether to land it.")
+        if pr.stdout.strip():
+            print(pr.stdout.strip())
+    else:
+        print("gh unavailable or PR creation failed - branch is pushed anyway.")
+        print("open the draft PR by hand with:")
+        print(f"  {shlex.join(gh_create)}")
+    print("never auto-readied, never auto-merged - review and merge this by hand.")
+    return 0
+
+
 # --- argument parsing ----------------------------------------------------------
 
 
@@ -781,6 +933,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_watch_status.add_argument("--repo", type=Path, default=Path.cwd())
     p_watch_status.set_defaults(func=cmd_watch_status)
+
+    p_propose_revert = sub.add_parser(
+        "propose-revert",
+        help="branch + draft PR that reverts <sha> - proposes only, never lands it",
+    )
+    p_propose_revert.add_argument("sha", help="commit to revert, resolved in --repo's history")
+    p_propose_revert.add_argument("--repo", type=Path, default=Path.cwd())
+    p_propose_revert.add_argument(
+        "--reason",
+        type=Path,
+        default=None,
+        help="path to a file embedded verbatim, as data, as failure context in the PR body",
+    )
+    p_propose_revert.set_defaults(func=cmd_propose_revert)
 
     return parser
 
