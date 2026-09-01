@@ -1127,11 +1127,13 @@ def test_timeout_is_never_retried_even_with_retry_flaky_on(tmp_path):
     assert len(counter.read_text().splitlines()) == 1  # never retried
 
 
-def test_batch_red_bisection_count_unaffected_by_retry_flaky(tmp_path):
-    # retry_flaky is process_branch-only (see _run_gate_with_retry's
-    # docstring) - passing it through run_train while batch=2 must not touch
-    # _run_batch's gate-run accounting at all, since run_train never forwards
-    # retry_flaky into _run_batch/_run_gate in the first place.
+def test_batch_retry_flaky_only_retries_the_size_one_leaf_gate(tmp_path):
+    # retry_flaky now threads into _run_batch (I7), but ONLY the SIZE-1
+    # bisected leaf - the point where a single culprit is being judged alone
+    # - ever gets the identical-gate retry. The initial whole-group gate run
+    # (here, the full AB pair) is never retried even with retry_flaky on, so
+    # a genuinely broken batch does not silently double its own gate-run
+    # cost at every level of the bisection.
     origin, station = make_world(tmp_path)
     counter = tmp_path / "count"
     gate = [
@@ -1145,7 +1147,75 @@ def test_batch_red_bisection_count_unaffected_by_retry_flaky(tmp_path):
     )
 
     assert [r.status for r in results] == ["landed", "rejected"]
-    assert len(counter.read_text().splitlines()) == 3  # AB, A, B - unchanged from batch=2 alone
+    # AB (red, size 2 - not a leaf, no retry) + A (green leaf, no retry
+    # needed) + B (red leaf, retried once, deterministically still red) =
+    # 1 + 1 + 2 = 4 - one more than the 3 a batch=2 run gets with
+    # retry_flaky off (see test_batch_red_bisects_to_culprit).
+    assert len(counter.read_text().splitlines()) == 4
+    assert git(origin, "show", "main:good.txt") == "good change"
+    with pytest.raises(subprocess.CalledProcessError):
+        git(origin, "show", "main:bad.txt")
+
+
+def test_batch_retry_flaky_rescues_the_size_one_leaf_and_logs_it(tmp_path):
+    # The top-level AB candidate is always red (forcing bisection down to
+    # per-branch leaves); claude/bad's own leaf then flakes - it fails the
+    # first time it is gated ALONE, and passes every time after - while
+    # claude/good's leaf is clean on its first try. Only the size-1 leaf
+    # gets the identical-gate retry; claude/bad must land via that rescue
+    # (marked flaky, logged to flaky_log.jsonl), and claude/good must land
+    # normally alongside it.
+    #
+    # Keyed on two marker files rather than "which of good.txt/bad.txt are
+    # present": push-mode landing advances the real origin/main the instant
+    # claude/good's own leaf lands, so by the time claude/bad's leaf is
+    # gated, its candidate (bad merged onto that now-advanced main) contains
+    # BOTH files too - "both present" is not a reliable stand-in for "this
+    # is the original top-level pair".
+    origin, station = make_world(tmp_path)
+    counter = tmp_path / "count"
+    top_seen = tmp_path / "top_seen"
+    bad_seen = tmp_path / "bad_seen"
+    gate_script = tmp_path / "flaky_leaf_gate.sh"
+    gate_script.write_text(
+        "#!/bin/sh\n"
+        f"echo x >> {counter}\n"
+        "if test -f bad.txt; then\n"
+        f"  if test -f {top_seen}; then\n"
+        f"    if test -f {bad_seen}; then\n"
+        "      exit 0\n"
+        "    else\n"
+        f"      touch {bad_seen}\n"
+        "      exit 1\n"
+        "    fi\n"
+        "  else\n"
+        f"    touch {top_seen}\n"
+        "    exit 1\n"
+        "  fi\n"
+        "else\n"
+        "  exit 0\n"
+        "fi\n"
+    )
+    gate_script.chmod(0o755)
+    gate = [str(gate_script)]
+
+    results = run_train(
+        repo=station, branches=["claude/good", "claude/bad"], gate=gate, batch=2, retry_flaky=True
+    )
+
+    by_branch = {r.branch: r for r in results}
+    assert by_branch["claude/good"].status == "landed"
+    assert by_branch["claude/good"].flaky is False
+    assert by_branch["claude/bad"].status == "landed"
+    assert by_branch["claude/bad"].flaky is True
+    assert git(origin, "show", "main:good.txt") == "good change"
+    assert git(origin, "show", "main:bad.txt") == "bad change"
+
+    flaky_log = station / ".train" / "flaky_log.jsonl"
+    lines = flaky_log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert "gate failed" in entry["first_tail"]
 
 
 # --- notifications (opt-in, cfg.notify -> run_train(notify_mode=...)) -------

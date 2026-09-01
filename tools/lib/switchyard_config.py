@@ -54,9 +54,10 @@ class SwitchyardConfig:
     live_prefixes: tuple[str, ...] = ("claude/", "fix/", "feat/")
     batch: int = 1
     priority_label: str = "train-priority"
-    # process_branch's single-branch landing path only (never the --batch
-    # path, see merge_train.py's _run_gate_with_retry docstring): retry an
-    # identical failing gate once before rejecting, logging a rescue to
+    # process_branch's single-branch landing path, and --batch's size-1
+    # bisected leaf (never a multi-member batch gate - see merge_train.py's
+    # _run_gate_with_retry docstring): retry an identical failing gate once
+    # before rejecting, logging a rescue to
     # .train/flaky_log.jsonl instead of landing silently. True is the
     # owner-approved default for real (CLI/config-driven) runs; run_train()
     # and process_branch() themselves default this to False so every

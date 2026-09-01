@@ -81,8 +81,10 @@ every existing caller (including every test in this file) that never
 mentions config keeps today's exact hardcoded-default behavior.
 
 Retry-once + flaky quarantine register (process_branch's single-branch
-landing path only - never --batch, see _run_gate_with_retry's docstring):
-when the gate fails for a reason OTHER than a timeout, the identical gate is
+landing path, and --batch's size-1 bisected leaf - the point where a single
+culprit branch is judged alone; a multi-member candidate's own gate run is
+never retried, see _run_gate_with_retry's docstring): when the gate fails
+for a reason OTHER than a timeout, the identical gate is
 immediately rerun once before the branch is rejected. A rescue (fail then
 pass) still lands the branch, but the failure is never silently thrown
 away: one line is appended to .train/flaky_log.jsonl and a loud warning is
@@ -652,12 +654,19 @@ def _run_gate_with_retry(
     a human the evidence, and the timestamp gives every entry an implicit
     expiry (an old, never-repeated one is not worth chasing).
 
-    Only ever called from process_branch. _run_batch calls plain _run_gate
-    directly and must keep doing so: a batch candidate's gate outcome is
-    deterministic in the tree it tests, and test_batch_red_bisects_to_culprit
-    asserts an exact gate-run count for its bisection - retrying there would
-    silently double every red run's count and desync that accounting. Retry-
-    once is deliberately scoped to the single-branch landing path only.
+    Called from process_branch for every single-branch gate run, and from
+    _run_batch but ONLY for a SIZE-1 bisected leaf - the point where a
+    single culprit branch is being judged alone, exactly like the
+    single-branch path judges one branch. A multi-member candidate's own
+    gate run (2+ members still in play) always goes through plain _run_gate
+    instead, never retried: retrying a big batch's gate would mask too much
+    (a real, reproducible failure hiding behind any ONE of several members
+    would get a free pass), and test_batch_red_bisects_to_culprit
+    (retry_flaky off, its default) still asserts an exact gate-run count for
+    that case. Once bisection narrows a red batch down to a single member,
+    judging that member is exactly the same question process_branch's own
+    gate run asks, so it gets the same retry-once treatment and the same
+    flaky_log.jsonl trail (see test_batch_retry_flaky_rescues_the_size_one_leaf_and_logs_it).
 
     A timeout is never retried: a hung gate will not run faster the second
     time, and retrying it only doubles the wait before a rejection the first
@@ -937,6 +946,7 @@ def _run_batch(
     gate_timeout: int,
     land: str,
     protected: str = "main",
+    retry_flaky: bool = False,
 ) -> list[TrainResult]:
     """Build a candidate from `group` (in order), gate it once, and on red
     bisect - bors-ng's O(failing x log N) strategy.
@@ -948,6 +958,12 @@ def _run_batch(
     their final TrainResult before the gate ever runs; they are simply
     stitched back into the result list here and never affect the
     gate/bisect decision, which is made purely on `built`.
+
+    `retry_flaky` is honored ONLY when `built` has exactly one member - the
+    bisected leaf where a single culprit is being judged alone, the same
+    question process_branch's own gate run asks for an unbatched branch. A
+    multi-member candidate's gate is always run plain, once, never retried -
+    see _run_gate_with_retry's docstring for why.
     """
     _git(repo, "fetch", "origin", "--prune")
     _git(repo, "checkout", protected)
@@ -961,12 +977,25 @@ def _run_batch(
 
     tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
     key = _cache_key(tree, gate)
-    gate_detail, gate_seconds = _run_gate(repo, gate, gate_timeout, dry_run, key)
+    is_leaf = len(built) == 1
+    if is_leaf:
+        gate_detail, gate_seconds, gate_flaky = _run_gate_with_retry(
+            repo, gate, gate_timeout, dry_run, key, tree, retry_flaky
+        )
+    else:
+        gate_detail, gate_seconds = _run_gate(repo, gate, gate_timeout, dry_run, key)
+        gate_flaky = False
 
     if gate_detail is None:
         landed = _land_batch(repo, built, tree, head_shas, land, dry_run, protected)
         landed = [
-            dataclasses.replace(r, gate_seconds=gate_seconds, tree=tree, batch_size=group_size)
+            dataclasses.replace(
+                r,
+                gate_seconds=gate_seconds,
+                tree=tree,
+                batch_size=group_size,
+                flaky=gate_flaky and r.status == "landed",
+            )
             for r in landed
         ]
         return set_aside + landed
@@ -980,8 +1009,12 @@ def _run_batch(
         ]
 
     mid = len(built) // 2
-    left_results = _run_batch(repo, built[:mid], gate, dry_run, gate_timeout, land, protected)
-    right_results = _run_batch(repo, built[mid:], gate, dry_run, gate_timeout, land, protected)
+    left_results = _run_batch(
+        repo, built[:mid], gate, dry_run, gate_timeout, land, protected, retry_flaky
+    )
+    right_results = _run_batch(
+        repo, built[mid:], gate, dry_run, gate_timeout, land, protected, retry_flaky
+    )
     return set_aside + left_results + right_results
 
 
@@ -1076,8 +1109,10 @@ def run_train(
                 group = queue[i : i + batch]
                 group_gate = gate_factory(group[0]) if gate_factory else gate
                 try:
+                    # retry_flaky threads through to _run_batch's own size-1
+                    # leaf retry - see _run_gate_with_retry's docstring.
                     group_results = _run_batch(
-                        repo, group, group_gate, dry_run, gate_timeout, land, protected
+                        repo, group, group_gate, dry_run, gate_timeout, land, protected, retry_flaky
                     )
                 except Exception as exc:  # noqa: BLE001 - one broken group must not stall the queue
                     detail = f"{type(exc).__name__}: {exc}"
