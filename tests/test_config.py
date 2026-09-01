@@ -507,3 +507,251 @@ def test_cli_without_trusted_only_flag_honors_repo_local_config(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "attacker"  # non-trusted path still reads repo-local config
+
+
+# --- the protected-branch fallback (step 3) ---------------------------------
+#
+# switchyard.toml states facts about the REPO, but lived only in the working
+# tree, so a checkout parked on any branch older than the file resolved every
+# key to its default at once - silently. These lock in that the trunk's copy
+# fills that gap, that it never overrides a working-tree copy, and that it
+# stays invisible to trusted-only (guard) reads.
+
+GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+}
+
+
+def git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**GIT_ENV, "HOME": str(repo)},
+    )
+    return proc.stdout.strip()
+
+
+def make_repo_with_trunk_config(
+    tmp_path: Path, config_text: str, trunk: str = "main", stale_branch: str = "stale"
+) -> Path:
+    """A real repo whose trunk carries switchyard.toml and whose checked-out
+    branch predates it - the exact shape of the bug this fallback fixes."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", trunk)
+    (repo / "app.txt").write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "base")
+    (repo / "switchyard.toml").write_text(config_text)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "add switchyard.toml")
+    git(repo, "checkout", "-b", stale_branch, f"{trunk}~1")
+    assert not (repo / "switchyard.toml").exists()
+    return repo
+
+
+def test_trunk_config_is_used_when_the_working_tree_lacks_it(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = make_repo_with_trunk_config(
+        tmp_path, '[switchyard]\nwip_cap = 7\nworktree_dir = "/tracks"\n'
+    )
+
+    cfg = load_config(repo)
+
+    # Before this fallback existed both of these were the dataclass defaults,
+    # which is what made `switchyard track new` unusable from such a checkout.
+    assert cfg.wip_cap == 7
+    assert cfg.worktree_dir == "/tracks"
+
+
+def test_trunk_fallback_names_the_source_it_actually_read(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = make_repo_with_trunk_config(tmp_path, "[switchyard]\nwip_cap = 7\n")
+
+    load_config(repo)
+
+    # Reading config from somewhere other than where the file appears to be
+    # must never be silent - a gate running the wrong interpreter is far too
+    # expensive a way to find out.
+    err = capsys.readouterr().err
+    assert "main:switchyard.toml" in err
+    assert "not in this working tree" in err
+
+
+def test_working_tree_config_wins_over_the_trunks_copy(tmp_path, monkeypatch):
+    # Step 3 is a floor, not an override: a branch deliberately iterating on
+    # its own switchyard.toml must not be silently overruled by the trunk.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = make_repo_with_trunk_config(tmp_path, "[switchyard]\nwip_cap = 7\n")
+    (repo / "switchyard.toml").write_text("[switchyard]\nwip_cap = 42\n")
+
+    cfg = load_config(repo)
+
+    assert cfg.wip_cap == 42
+
+
+def test_trunk_fallback_reads_the_protected_branch_named_by_trusted_config(tmp_path, monkeypatch):
+    # Which ref to read is bootstrapped from trusted sources only - asking the
+    # repo-local config would be circular, since it is the very file that is
+    # missing. A project whose trunk is not called "main" configures that in
+    # $SWITCHYARD_CONFIG or ~/.config, and the fallback follows it.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = make_repo_with_trunk_config(tmp_path, "[switchyard]\nwip_cap = 77\n", trunk="trunk")
+
+    home_cfg_dir = tmp_path / ".config" / "switchyard"
+    home_cfg_dir.mkdir(parents=True)
+    (home_cfg_dir / "config.toml").write_text('[switchyard]\nprotected_branch = "trunk"\n')
+
+    cfg = load_config(repo)
+
+    assert cfg.wip_cap == 77
+
+
+def test_trunk_fallback_finds_nothing_when_the_trunk_is_named_something_else(tmp_path, monkeypatch):
+    # The honest limit of the bootstrap: with no trusted config to say
+    # otherwise the fallback looks at "main", so a repo whose trunk is called
+    # something else and that configures nothing gets defaults, exactly as it
+    # did before. Documented here rather than left to be discovered.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = make_repo_with_trunk_config(tmp_path, "[switchyard]\nwip_cap = 77\n", trunk="trunk")
+
+    cfg = load_config(repo)
+
+    assert cfg == SwitchyardConfig()
+
+
+def test_trusted_only_never_reads_the_trunks_copy_either(tmp_path, monkeypatch):
+    # The guard boundary is unchanged by this fallback: guard-scoping keys
+    # still come only from $SWITCHYARD_CONFIG or ~/.config, never from the
+    # repo, from any branch, by any route.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = make_repo_with_trunk_config(
+        tmp_path, '[switchyard]\nprotected_branch = "attacker"\nwip_cap = 7\n'
+    )
+
+    cfg = load_config(repo, trusted_only=True)
+
+    assert cfg.protected_branch == "main"
+    assert cfg.wip_cap == 5
+
+
+def test_home_config_still_applies_when_no_config_exists_on_the_trunk(tmp_path, monkeypatch):
+    # Ordering preserved: the trunk copy sits above the home config, not
+    # below it, and its absence must not swallow the home config.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    (repo / "app.txt").write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "base")
+
+    home_cfg_dir = tmp_path / ".config" / "switchyard"
+    home_cfg_dir.mkdir(parents=True)
+    (home_cfg_dir / "config.toml").write_text("[switchyard]\nwip_cap = 11\n")
+
+    cfg = load_config(repo)
+
+    assert cfg.wip_cap == 11
+
+
+def test_env_var_still_wins_over_the_trunks_copy(tmp_path, monkeypatch):
+    repo = make_repo_with_trunk_config(tmp_path, "[switchyard]\nwip_cap = 7\n")
+    explicit = tmp_path / "explicit.toml"
+    explicit.write_text("[switchyard]\nwip_cap = 3\n")
+    monkeypatch.setenv("SWITCHYARD_CONFIG", str(explicit))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    cfg = load_config(repo)
+
+    assert cfg.wip_cap == 3
+
+
+def test_malformed_trunk_config_falls_back_to_defaults_with_a_warning(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = make_repo_with_trunk_config(tmp_path, "[switchyard]\nwip_cap = = 7\n")
+
+    cfg = load_config(repo)
+
+    assert cfg == SwitchyardConfig()
+    assert "malformed TOML in main:switchyard.toml" in capsys.readouterr().err
+
+
+def test_trunk_fallback_survives_a_directory_that_only_looks_like_a_repo(tmp_path, monkeypatch):
+    # A bare `.git` directory with no git objects behind it: `git show` fails,
+    # the fallback yields nothing, and load_config must still return cleanly
+    # rather than raise. The guards call this on every invocation.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    assert load_config(repo) == SwitchyardConfig()
+
+
+# --- config_get.sh must agree with load_config about the trunk fallback -----
+#
+# The bash guards decide whether to invoke the parser at all by looking for a
+# config file themselves. If that check says "unconfigured" while load_config
+# says "configured from the trunk", every guard silently reads its hardcoded
+# default instead of the project's real setting - two readers of one config
+# disagreeing about whether it exists, which is the failure this whole
+# fallback was written to end.
+
+CONFIG_GET_SH = Path(__file__).resolve().parents[1] / "tools" / "lib" / "config_get.sh"
+
+
+def run_sy_cfg(repo: Path, func: str, key: str, default: str) -> str:
+    proc = subprocess.run(
+        ["bash", "-c", f'source "$1"; {func} "$2" "$3"', "_", str(CONFIG_GET_SH), key, default],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        # A >=3.11 interpreter by explicit path: PATH here is deliberately
+        # minimal, and macOS's /usr/bin/python3 predates tomllib.
+        env={**GIT_ENV, "HOME": str(repo), "SWITCHYARD_PYTHON": sys.executable},
+        timeout=30,
+        check=False,
+    )
+    return proc.stdout.strip()
+
+
+def test_sy_cfg_reads_a_value_carried_only_by_the_trunk(tmp_path):
+    repo = make_repo_with_trunk_config(tmp_path, "[switchyard]\nwip_cap = 7\n")
+
+    assert run_sy_cfg(repo, "sy_cfg", "wip_cap", "5") == "7"
+
+
+def test_sy_cfg_trusted_still_ignores_the_trunks_copy(tmp_path):
+    repo = make_repo_with_trunk_config(tmp_path, '[switchyard]\nprotected_branch = "attacker"\n')
+
+    assert run_sy_cfg(repo, "sy_cfg_trusted", "protected_branch", "main") == "main"
+
+
+def test_sy_cfg_still_returns_its_default_in_a_repo_with_no_config_anywhere(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    (repo / "app.txt").write_text("v1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "base")
+
+    assert run_sy_cfg(repo, "sy_cfg", "wip_cap", "5") == "5"

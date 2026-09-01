@@ -10,12 +10,19 @@
 # $SWITCHYARD_CONFIG or ~/.config/switchyard/config.toml, both outside a PR
 # author's control (see switchyard_config.load_config's trusted_only).
 #
-# Kept fast on the common (unconfigured) path: a config file is only ever
+# Kept cheap on the common (unconfigured) path: a config file is only ever
 # looked for at the locations load_config() (or its trusted_only mode)
-# itself resolves against, via cheap file-existence checks - the python
-# helper is invoked ONLY when one of those actually exists. When none do,
-# sy_cfg/sy_cfg_trusted are a pure bash string-echo with zero extra process
-# cost, so every guard stays as fast as it was before this file existed.
+# itself resolves against - the python helper is invoked ONLY when one of
+# those actually exists. sy_cfg_trusted stays a pure bash string-echo with
+# zero extra process cost when unconfigured.
+#
+# sy_cfg is no longer quite free in a git repo that carries no
+# switchyard.toml in its working tree: it now also asks git whether the
+# protected branch carries one, matching load_config's trunk fallback (see
+# _sy_config_present). That is one `git cat-file -e` on a path that already
+# ran `git rev-parse --show-toplevel`, and only when no working-tree file
+# was found - a few milliseconds, never the python interpreter. Outside a
+# git repo, and in any repo that does carry the file, nothing changed.
 #
 # The python interpreter used to run that helper is resolved via
 # tools/lib/resolve_python.sh's sy_resolve_python - never a bare
@@ -38,7 +45,19 @@ _sy_config_present() {
   [ -n "${SWITCHYARD_CONFIG:-}" ] && return 0
   local top
   top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""
-  [ -n "$top" ] && [ -f "$top/switchyard.toml" ] && return 0
+  if [ -n "$top" ]; then
+    [ -f "$top/switchyard.toml" ] && return 0
+    # Working tree has no copy, but the protected branch may - load_config
+    # falls back to `git show <protected>:switchyard.toml` in exactly this
+    # case. Without the same check here, bash would answer "unconfigured",
+    # skip the parser entirely and hand every guard its hardcoded default
+    # while the python side considered the repo fully configured. Two
+    # readers of one config that disagree about whether it exists is the
+    # bug this whole fallback was written to end, so they must agree.
+    local protected
+    protected=$(sy_cfg_trusted protected_branch "main")
+    git cat-file -e "$protected:switchyard.toml" 2>/dev/null && return 0
+  fi
   [ -f "${HOME:-/nonexistent}/.config/switchyard/config.toml" ] && return 0
   return 1
 }

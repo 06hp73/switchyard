@@ -8,9 +8,18 @@
 #
 # Resolution order (first hit wins), see tools/lib/switchyard_config.py:
 #   1. $SWITCHYARD_CONFIG          - path to a toml file, used verbatim
-#   2. <git toplevel>/switchyard.toml
-#   3. ~/.config/switchyard/config.toml
-#   4. all defaults (this file's commented-out values)
+#   2. <git toplevel>/switchyard.toml, as the WORKING TREE has it
+#   3. <protected branch>:switchyard.toml - the trunk's copy, used only
+#      when step 2 finds no file, so a checkout parked on a branch older
+#      than the config still gets the project's real settings instead of
+#      silently falling all the way through to defaults. Whenever this
+#      step is used it says so on stderr.
+#   4. ~/.config/switchyard/config.toml
+#   5. all defaults (this file's commented-out values)
+#
+# Guard-scoping keys (protected_branch, product_remote_match) are read in a
+# trusted-only mode that skips steps 2 AND 3: a repo-local file must never
+# change what a guard protects, from any branch, by any route.
 #
 # A config file with a typo never breaks the tools: an unknown key is
 # ignored with a warning on stderr, and malformed TOML falls back to

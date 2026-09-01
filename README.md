@@ -40,7 +40,7 @@ demonstrably is not (Leßenich et al.).
 | `tools/train/gate.sh`, `tools/train/gate_full.sh` | The gate definitions: `gate.sh` (fast tier, default) runs lint + fast suite + machine-local characterization goldens; `gate_full.sh` (full tier, select per-branch via `--gate` for branches touching optimizer math) additionally runs the analytic golden-master suite and the optimizer fuzz/superadditivity/certificate proofs the fast tier excludes. Both pin the tested tree to the station checkout via an import preflight. Adapt to your project. |
 | `tools/train/json_merge_driver.py` | Key-path 3-way merge for JSON catalogs (i18n): different keys merge automatically, same-key edits conflict loudly, structural collapses resolve toward *ours* wholesale — never corrupt JSON, never silent loss (empty dicts are leaves). |
 | `tools/train/setup_station.sh` | Creates the train's own full clone ("the station") — a separate clone, not a worktree, because the train must hold `main` at all times. |
-| `tools/lib/switchyard_config.py` | The project config layer: loads `switchyard.toml` (env var, repo-toplevel, or `~/.config/switchyard/`, in that order) into a `SwitchyardConfig`. Every field defaults to today's hardcoded behavior, so an absent file changes nothing; a broken one (malformed TOML, unknown key) warns on stderr and falls back to defaults rather than crashing. |
+| `tools/lib/switchyard_config.py` | The project config layer: loads `switchyard.toml` (env var, repo working tree, the protected branch's copy, or `~/.config/switchyard/`, in that order) into a `SwitchyardConfig`. Every field defaults to today's hardcoded behavior, so an absent file changes nothing; a broken one (malformed TOML, unknown key) warns on stderr and falls back to defaults rather than crashing. |
 | `tools/lib/config_get.sh` | Bash-side `sy_cfg <key> <default>` — lets the guards read one config value without paying a Python startup cost when no config file exists at all. |
 | `tools/cli.py`, `bin/switchyard` | The unified `switchyard` CLI: `status` (one composed, read-only view — WIP, radar, queue via `gh`, flaky log if present, last landings), `stats` (counts, landing rate, gate-time mean/p90, top rejected branches from `.train/history.jsonl`), and thin `radar`/`land` passthroughs to the modules above (every flag forwards verbatim, so behavior never drifts from calling those scripts directly). Every `status`/`stats` section degrades independently — a missing `gh`, an untrained repo, or a missing `.train/` file never takes the rest of the view down. |
 
@@ -210,9 +210,26 @@ cp switchyard.toml.example switchyard.toml
 Resolution order (first hit wins) — see `tools/lib/switchyard_config.py`:
 
 1. `$SWITCHYARD_CONFIG` — path to a toml file, used verbatim.
-2. `<git toplevel>/switchyard.toml` — the config next to the repo it applies to.
-3. `~/.config/switchyard/config.toml` — a machine-wide fallback.
-4. All defaults, if none of the above exist.
+2. `<git toplevel>/switchyard.toml` — as the **working tree** has it.
+3. `<protected branch>:switchyard.toml` — the **trunk's** copy, read with
+   `git show`, used only when step 2 finds no file.
+4. `~/.config/switchyard/config.toml` — a machine-wide fallback.
+5. All defaults, if none of the above exist.
+
+Step 3 exists because `switchyard.toml` states facts about the *repo* — where
+its worktrees live, which interpreter the gates run, where the station is —
+yet keeping it in a tracked file made those facts hostage to whichever branch
+happened to be checked out. A checkout parked on a branch older than the file
+resolved every key to its default at once, silently: the wrong interpreter, no
+station, the default gates, and an empty `worktree_dir` that makes `track new`
+refuse to run. Falling back to the trunk's copy ends that. Step 2 still wins
+outright when it finds a file, so a branch iterating on its own
+`switchyard.toml` is never overridden; and whenever step 3 is used it says so
+on stderr rather than switching sources silently.
+
+Guard-scoping keys (`protected_branch`, `product_remote_match`) are read in a
+trusted-only mode that skips steps 2 **and** 3 — a repo-local file must never
+change what a guard protects, from any branch, by any route.
 
 ```toml
 [switchyard]
@@ -228,7 +245,7 @@ of crashing — a broken config must never brick a guard. See
 
 ## Tests
 
-246 tests, plain pytest, no project dependencies (needs Python 3.11+ for
+259 tests, plain pytest, no project dependencies (needs Python 3.11+ for
 `tomllib` — see `tools/lib/switchyard_config.py`):
 
 ```bash
