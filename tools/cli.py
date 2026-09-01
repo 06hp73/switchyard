@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import statistics
 import subprocess
 import sys
@@ -317,6 +318,221 @@ def cmd_land(rest: list[str]) -> int:
         sys.argv = old_argv
 
 
+# --- switchyard track new / done: track lifecycle -----------------------------
+
+
+def _find_worktree_for_branch(repo: Path, branch: str) -> Path | None:
+    """The real, currently-registered worktree path for `branch`, via git itself.
+
+    Trusting the configured worktree_dir/name alone would drift the moment
+    a worktree is moved or was created some other way; `git worktree list`
+    is the one source of truth for where a branch's worktree actually lives.
+    Returns None if `branch` has no worktree registered at all.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    current_path: str | None = None
+    target_ref = f"refs/heads/{branch}"
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree ") :]
+        elif line.startswith("branch ") and current_path and line[len("branch ") :] == target_ref:
+            return Path(current_path)
+    return None
+
+
+def cmd_track_new(args: argparse.Namespace) -> int:
+    repo = args.repo.resolve()
+    cfg = load_config(repo)
+    name = args.name
+
+    if not cfg.worktree_dir:
+        print(
+            "switchyard track new: worktree_dir is not set in switchyard.toml - "
+            "set [switchyard].worktree_dir to the directory track worktrees should live in"
+        )
+        return 2
+
+    branch = f"{cfg.branch_prefix}{name}"
+    worktree_path = Path(cfg.worktree_dir).expanduser() / name
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Atomic: creates `branch` from the protected branch's tip AND attaches
+    # the worktree to it in one step, so there is no intermediate state
+    # where the branch exists but no worktree does (or vice versa).
+    add = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(worktree_path),
+            cfg.protected_branch,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if add.returncode != 0:
+        print(f"switchyard track new: could not create branch/worktree: {add.stderr.strip()}")
+        return 2
+
+    push = subprocess.run(
+        ["git", "-C", str(repo), "push", "-u", "origin", branch],
+        capture_output=True,
+        text=True,
+    )
+    if push.returncode != 0:
+        print(
+            f"switchyard track new: push failed (branch + worktree still created locally): "
+            f"{push.stderr.strip()}"
+        )
+
+    gh = merge_train._gh_exe()
+    pr_title = f"wip: {name}"
+    pr_body = (
+        f"Work track for `{branch}`.\n\n"
+        "<!-- write-zone: fill in what this track owns/touches, and what it must not touch. -->\n"
+    )
+    gh_create = [
+        gh,
+        "pr",
+        "create",
+        "--title",
+        pr_title,
+        "--draft",
+        "--body",
+        pr_body,
+        "--head",
+        branch,
+        "--base",
+        cfg.protected_branch,
+    ]
+    try:
+        pr = subprocess.run(gh_create, capture_output=True, text=True, cwd=repo, timeout=60)
+        gh_ok = pr.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        gh_ok = False
+
+    print(f"worktree ready: {worktree_path}")
+    print(f"branch: {branch}")
+    if gh_ok:
+        print("draft PR opened.")
+    else:
+        print("gh unavailable or PR creation failed - branch and worktree are ready anyway.")
+        print("open the draft PR later with:")
+        print(f"  {shlex.join(gh_create)}")
+    print(f"next: cd {worktree_path} && start working")
+    return 0
+
+
+def cmd_track_done(args: argparse.Namespace) -> int:
+    repo = args.repo.resolve()
+    cfg = load_config(repo)
+    name = args.name
+    branch = f"{cfg.branch_prefix}{name}"
+
+    if not args.force_local:
+        gh = merge_train._gh_exe()
+        try:
+            pr_list = subprocess.run(
+                [
+                    gh,
+                    "pr",
+                    "list",
+                    "--head",
+                    branch,
+                    "--base",
+                    cfg.protected_branch,
+                    "--state",
+                    "merged",
+                    "--json",
+                    "number",
+                    "--limit",
+                    "1",
+                    "-q",
+                    ".[0].number",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=repo,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"switchyard track done: could not verify a MERGED PR via gh ({exc}) - "
+                "pass --force-local to skip this check if you are certain"
+            )
+            return 2
+        merged_number = pr_list.stdout.strip()
+        if pr_list.returncode != 0 or not merged_number or merged_number == "null":
+            print(
+                f"switchyard track done: no MERGED PR found for {branch} - refusing to clean up "
+                "(pass --force-local to skip this check if you are certain)"
+            )
+            return 2
+
+    worktree_path = _find_worktree_for_branch(repo, branch)
+    if worktree_path is None and cfg.worktree_dir:
+        worktree_path = Path(cfg.worktree_dir).expanduser() / name
+
+    if args.dry_run:
+        print(f"[dry-run] would remove worktree: {worktree_path}")
+        print(f"[dry-run] would delete local branch: {branch} (-D)")
+        print(f"[dry-run] would delete remote branch: origin/{branch}")
+        return 0
+
+    if worktree_path is not None and Path(worktree_path).exists():
+        # No --force: git itself refuses when the worktree has local
+        # modifications or untracked files, which IS the "refuse if dirty"
+        # check - no need to duplicate that logic here.
+        remove = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "remove", str(worktree_path)],
+            capture_output=True,
+            text=True,
+        )
+        if remove.returncode != 0:
+            print(f"switchyard track done: worktree remove refused: {remove.stderr.strip()}")
+            return 2
+
+    # -D, not -d: this repo's convention is squash-merge onto the protected
+    # branch, so the track branch's own commits never become reachable from
+    # main's ancestry - `git branch -d`'s "is this merged" check would
+    # refuse every single track branch by design, even ones that landed
+    # cleanly, so -D is the correct (not just the forceful) choice here.
+    delete_local = subprocess.run(
+        ["git", "-C", str(repo), "branch", "-D", branch],
+        capture_output=True,
+        text=True,
+    )
+    if delete_local.returncode != 0:
+        print(
+            f"switchyard track done: could not delete local branch: {delete_local.stderr.strip()}"
+        )
+        return 2
+
+    delete_remote = subprocess.run(
+        ["git", "-C", str(repo), "push", "origin", "--delete", branch],
+        capture_output=True,
+        text=True,
+    )
+    if delete_remote.returncode != 0:
+        print(
+            f"switchyard track done: remote branch delete skipped/failed (tolerated): "
+            f"{delete_remote.stderr.strip()[:200]}"
+        )
+
+    print(f"track {name} cleaned up.")
+    return 0
+
+
 # --- argument parsing ----------------------------------------------------------
 
 
@@ -340,6 +556,31 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "land", help="passthrough to `tools/train/merge_train.py run` (see --help there)"
     )
+
+    p_track = sub.add_parser("track", help="track lifecycle: new, done")
+    track_sub = p_track.add_subparsers(dest="track_cmd", required=True)
+
+    p_track_new = track_sub.add_parser(
+        "new", help="create a branch + worktree + draft PR for a new track"
+    )
+    p_track_new.add_argument("name")
+    p_track_new.add_argument("--repo", type=Path, default=Path.cwd())
+    p_track_new.set_defaults(func=cmd_track_new)
+
+    p_track_done = track_sub.add_parser(
+        "done", help="verify the branch's PR merged, then remove its worktree + branches"
+    )
+    p_track_done.add_argument("name")
+    p_track_done.add_argument("--repo", type=Path, default=Path.cwd())
+    p_track_done.add_argument(
+        "--force-local",
+        action="store_true",
+        help="skip the gh 'PR is MERGED' check (also used when gh is unavailable)",
+    )
+    p_track_done.add_argument(
+        "--dry-run", action="store_true", help="print what would happen, change nothing"
+    )
+    p_track_done.set_defaults(func=cmd_track_done)
 
     return parser
 

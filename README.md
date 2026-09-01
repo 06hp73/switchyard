@@ -78,6 +78,8 @@ bin/switchyard status --repo <station>   # one composed view: WIP, radar, queue,
 bin/switchyard stats  --repo <station>   # .train/history.jsonl: counts, landing rate, gate-time mean/p90
 bin/switchyard radar  --repo <station>   # passthrough - identical to collision_radar.py's own flags
 bin/switchyard land   --repo <station>   # passthrough - identical to `merge_train.py run`'s own flags
+bin/switchyard track new <name>          # branch + worktree from `worktree_dir`/`branch_prefix` + draft PR
+bin/switchyard track done <name>         # verify the PR merged (or --force-local), then remove worktree + branches
 ```
 
 `status` and `stats` are read-only and safe to run anytime, including
@@ -85,6 +87,18 @@ against a repo that has never trained: each section (WIP/RADAR/QUEUE/FLAKY/
 LAST LANDINGS) reports its own "nothing here yet" line instead of failing
 the whole view when its data source (`gh`, `.train/history.jsonl`, ...) is
 absent.
+
+`track new`/`track done` need `worktree_dir` set in `switchyard.toml`
+(`track new` errors with a clear message otherwise); `branch_prefix`
+defaults to `"claude/"`. Without `gh` on `PATH`, `track new` still creates
+the branch, worktree, and push, and prints the `gh pr create` command to
+run by hand later; `track done` without `gh` needs `--force-local` (it
+otherwise refuses to clean up a branch it cannot confirm was merged).
+`track done`'s local-branch delete is `-D`, not `-d`, on purpose: this
+repo's own convention is squash-merge onto the protected branch, so a
+landed track branch's commits never become reachable from its ancestry —
+`git branch -d`'s "is this merged" check would refuse every track branch by
+design, even ones that landed cleanly.
 
 ## Configuration
 
@@ -117,7 +131,8 @@ of crashing — a broken config must never brick a guard. See
 
 ## Tests
 
-82 tests, plain pytest, no project dependencies:
+98 tests, plain pytest, no project dependencies (needs Python 3.11+ for
+`tomllib` — see `tools/lib/switchyard_config.py`):
 
 ```bash
 python3 -m pytest tests/ -q
