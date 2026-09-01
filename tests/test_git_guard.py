@@ -299,7 +299,13 @@ def test_home_config_can_still_change_protected_branch(tmp_path):
 
 
 def test_allows_feature_branch_push():
-    assert_allowed("git push")
+    # NOTE: a bare "git push" used to be asserted allowed unconditionally
+    # right here - that was the C3 vulnerability (see
+    # test_bare_push_depends_on_current_branch below): a bare push's real
+    # destination is whatever the current branch's upstream is, which this
+    # test's default cwd="/tmp" can never determine, so the only fail-safe
+    # answer for THAT cwd is "blocked". Bare push now has its own dedicated,
+    # branch-aware tests instead of a single unconditional assertion here.
     assert_allowed("git push -u origin claude/parallel-fix-collisions-b2d1f3")
     assert_allowed("rtk git push origin fix/fcr-export-adequacy")
     assert_allowed("git push origin main-feature")
@@ -307,6 +313,60 @@ def test_allows_feature_branch_push():
     assert_allowed("git push origin feature/main-fix")
     assert_allowed("git push origin claude/a:claude/a")
     assert_allowed("git push origin HEAD:claude/refresh")
+
+
+def make_repo_on_branch(base: Path, name: str, branch: str) -> Path:
+    """A real tmp git repo checked out on `branch`, no commits needed -
+    `git symbolic-ref --short HEAD` resolves correctly from an unborn branch
+    (created via `git init -b`) since it just reads what HEAD points to."""
+    repo = base / name
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", branch, str(repo)], check=True, capture_output=True)
+    return repo
+
+
+def test_bare_push_depends_on_current_branch(tmp_path):
+    # A bare "git push" (or "git push origin", "git push -u origin") carries
+    # no explicit refspec at all: its real destination is whatever the
+    # current branch's upstream is, which the command STRING alone can never
+    # show - it depends on which branch this runs from. The guard must
+    # resolve that from the hook's own cwd instead of assuming either way.
+    on_main = make_repo_on_branch(tmp_path, "bare-on-main", "main")
+    assert_blocked("git push", "train", cwd=str(on_main))
+    assert_blocked("git push origin", "train", cwd=str(on_main))
+    assert_blocked("git push -u origin", "train", cwd=str(on_main))
+
+    on_feature = make_repo_on_branch(tmp_path, "bare-on-feature", "claude/x")
+    assert_allowed("git push", cwd=str(on_feature))
+    assert_allowed("git push origin", cwd=str(on_feature))
+    assert_allowed("git push -u origin", cwd=str(on_feature))
+    assert_allowed("git push origin claude/x", cwd=str(on_feature))
+
+
+def test_push_head_depends_on_current_branch(tmp_path):
+    # "git push origin HEAD" with no colon has an implicit destination too -
+    # HEAD pushes the current branch to the same-named branch on the remote
+    # by default - so it is exactly as branch-dependent as a bare push.
+    on_main = make_repo_on_branch(tmp_path, "head-on-main", "main")
+    assert_blocked("git push origin HEAD", "train", cwd=str(on_main))
+
+    on_feature = make_repo_on_branch(tmp_path, "head-on-feature", "claude/y")
+    assert_allowed("git push origin HEAD", cwd=str(on_feature))
+
+
+def test_blocks_quoted_main_refspec():
+    # Wrapping the ref token in quotes used to be enough to slip past the
+    # old boundary-anchored regex (the token became `"main"`, not `main`,
+    # which never matched the whitespace-delimited pattern).
+    assert_blocked('git push origin "main"', "train")
+    assert_blocked("git push origin 'main'", "train")
+
+
+def test_bare_push_fail_safe_when_branch_undeterminable():
+    # cwd="/tmp" is not a git repo (or at least not one whose branch this
+    # test controls) - current branch can't be resolved, so a bare push
+    # must fail SAFE (blocked), not open.
+    assert_blocked("git push", "train", cwd="/tmp")
 
 
 def test_blocks_rm_rf_on_worktrees():

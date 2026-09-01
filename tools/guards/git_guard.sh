@@ -5,8 +5,10 @@
 #     four independent incident reports; CLAUDE.md mandates WIP commits instead)
 #   - git config user.* (identity drift breaks deploy author validation silently)
 #   - force pushes
-#   - any push to main IN THE PRODUCT REPO (main is written exclusively by the
-#     merge train there; other repos are out of scope, see below)
+#   - any push to the protected branch (default "main") IN THE PRODUCT REPO
+#     (that branch is written exclusively by the merge train there; other
+#     repos are out of scope, see below) - including implicit destinations
+#     (a bare push, or "push origin HEAD") resolved from the current branch
 #   - rm -rf on worktree directories (orphans git metadata; use git worktree remove)
 # Exit 0 = allow, exit 2 = block with reason on stderr.
 # Fail-open on parse errors: a broken guard must never paralyze sessions.
@@ -112,27 +114,96 @@ if printf '%s' "$NORM" | grep -qE 'git[[:space:]]+push\b.*(--force|--force-with-
   block "force-push is banned for all sessions."
 fi
 
-# \b is the wrong boundary here: it treats "-" and "/" as boundaries too, so
-# this used to block "main-feature", "feature-main", "feature/main-fix" —
-# none of which push to main. The ref token must instead be whitespace- (or
-# separator-) delimited. We pad the haystack with sentinel spaces and match
-# only [[:space:]]/[;&|] — deliberately NOT "(^|...)" or "(...|$)" — because
-# this grep's engine treats "^"/"$" used away from the very start/end of the
-# pattern text as a no-op that always matches (reproduced: "x(^|q)y" matches
-# "xy" on this box), which silently reopens the exact false-positive being
-# fixed here.
-# Colon-refspecs put the destination on the RIGHT of the colon
-# ("git push origin fix-branch:main", "git push origin :main" — a delete of
-# main — "git push origin HEAD:refs/heads/main"); the left side (source) is
-# irrelevant to "does this land on main" and may be empty. [^[:space:]]*
-# matches that left side (zero or more non-space chars, "" included) so
-# these are caught alongside the pre-existing bare-token alternatives; the
-# required [[:space:]] before the group and ([[:space:]]|[;&|]) after it
-# still anchor the match to a whole ref token, so "feature:main-fix" (whose
-# right side is "main-fix", not "main") is correctly left alone.
-if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ] \
-   && printf ' %s ' "$NORM" | grep -qE "git[[:space:]]+push\b[^;&|]*[[:space:]]([^[:space:]]*:refs/heads/${PROTECTED_BRANCH}|[^[:space:]]*:${PROTECTED_BRANCH}|refs/heads/${PROTECTED_BRANCH}|${PROTECTED_BRANCH})([[:space:]]|[;&|])"; then
-  block "pushing to $PROTECTED_BRANCH is reserved for the merge train. Push your feature branch and mark the PR ready; the train lands it after testing the combined tree."
+# A pure regex over the whole command string (the previous approach) cannot
+# express this rule correctly: a bare "git push" (no refspec at all) and
+# "git push origin HEAD" both have an IMPLICIT destination - whatever the
+# current branch's upstream is - which depends on which branch the command
+# runs from, not on anything in the command text. Quoting a ref token
+# ("main") also defeated a purely text-anchored match. So this rule instead
+# tokenizes each push invocation and classifies its actual refspec
+# argument(s), falling back to the current branch (resolved from the hook's
+# own cwd) only when the destination is implicit. Blocks when ANY of:
+#   - an explicit ref token's destination equals $PROTECTED_BRANCH (bare
+#     name, "refs/heads/<branch>", or the right side of a "src:dst"
+#     colon-refspec, including the delete form ":<branch>") - quotes around
+#     the token are stripped first;
+#   - there is NO explicit refspec at all (bare "git push", "git push
+#     origin", "git push -u origin") and the current branch is
+#     $PROTECTED_BRANCH, or the current branch could not be determined
+#     (fail safe);
+#   - the token is bare "HEAD" (no colon) and the same current-branch check
+#     applies, since HEAD's destination is equally implicit.
+# Extracted as one "git push ..." segment per invocation, run up to the next
+# command separator (";", "&&", "||", "&", "|") or end of string - same
+# segmentation the other rules in this file use for chained commands.
+if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ]; then
+  CURRENT_BRANCH=""
+  if [ -n "$CWD" ]; then
+    CURRENT_BRANCH=$(git -C "$CWD" symbolic-ref --short HEAD 2>/dev/null) \
+      || CURRENT_BRANCH=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null) \
+      || CURRENT_BRANCH=""
+    # A detached HEAD reports the literal string "HEAD" from rev-parse's
+    # fallback, not a real branch name - treat it as undeterminable.
+    [ "$CURRENT_BRANCH" = "HEAD" ] && CURRENT_BRANCH=""
+  fi
+
+  # Process substitution (not a pipe): a pipe would run this while-loop in a
+  # subshell in bash, and block()'s `exit 2` would then only exit that
+  # subshell, silently letting the push through. `< <(...)` keeps the loop
+  # in the current shell so exit actually aborts the whole script.
+  while IFS= read -r PUSH_SEG; do
+    [ -z "$PUSH_SEG" ] && continue
+    # [[:>:]] (BSD word-end boundary), not \b: BSD sed (macOS) does not
+    # honor \b here (same quirk as the "rtk " stripping note above) - it
+    # silently fails to match at all when nothing follows "push", leaving
+    # PUSH_SEG completely unstripped and corrupting the tokenization below.
+    REST=$(printf '%s' "$PUSH_SEG" | sed -E 's/^git[[:space:]]+push[[:>:]]//')
+    # shellcheck disable=SC2206 # word-splitting is intentional and safe:
+    # $REST was isolated to a single push invocation above, so it contains
+    # no ";"/"&"/"|" to mis-split on.
+    TOKENS=($REST)
+
+    POSITIONAL=()
+    for TOK in "${TOKENS[@]}"; do
+      case "$TOK" in
+        -*) : ;; # an option flag (-u, --force, --tags, ...), not a remote/refspec
+        *) POSITIONAL+=("$TOK") ;;
+      esac
+    done
+
+    BLOCK_THIS=0
+    if [ "${#POSITIONAL[@]}" -le 1 ]; then
+      # No explicit refspec: bare "git push" / "git push origin" /
+      # "git push -u origin" - destination is implicit.
+      if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "$PROTECTED_BRANCH" ]; then
+        BLOCK_THIS=1
+      fi
+    else
+      for REFSPEC in "${POSITIONAL[@]:1}"; do
+        UNQ="$REFSPEC"
+        case "$UNQ" in
+          \"*\") UNQ="${UNQ#\"}"; UNQ="${UNQ%\"}" ;;
+          \'*\') UNQ="${UNQ#\'}"; UNQ="${UNQ%\'}" ;;
+        esac
+
+        DST="$UNQ"
+        case "$UNQ" in
+          *:*) DST="${UNQ#*:}" ;; # colon refspec: only the destination (right side) matters
+        esac
+
+        if [ "$DST" = "$PROTECTED_BRANCH" ] || [ "$DST" = "refs/heads/$PROTECTED_BRANCH" ]; then
+          BLOCK_THIS=1
+        elif [ "$UNQ" = "HEAD" ] \
+             && { [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "$PROTECTED_BRANCH" ]; }; then
+          BLOCK_THIS=1
+        fi
+      done
+    fi
+
+    if [ "$BLOCK_THIS" = "1" ]; then
+      block "pushing to $PROTECTED_BRANCH is reserved for the merge train. Push your feature branch and mark the PR ready; the train lands it after testing the combined tree."
+    fi
+  done < <(printf '%s' "$NORM" | grep -oE 'git[[:space:]]+push\b[^;&|]*')
 fi
 
 if printf '%s' "$NORM" | grep -qE 'rm -r?f?r?\b.*\.claude/worktrees'; then
