@@ -72,6 +72,14 @@
 # plain FIFO-by-PR-number ordering (candidates_from_gh).
 # priority_label = "train-priority"
 
+# When a branch's gate fails (not a timeout), process_branch immediately
+# reruns the IDENTICAL gate once before rejecting. A rescue (fail then pass)
+# still lands, but is logged to .train/flaky_log.jsonl (see `switchyard
+# status`'s FLAKY section) rather than passing silently - a human decides
+# whether to actually quarantine the flaky test. --batch landings are never
+# retried this way. Disable per-run with --no-retry-flaky.
+# retry_flaky = true
+
 # Age in days after which a dependency-bump PR is considered stale for the
 # (future) dependency-freshness check.
 # deps_age_days = 7

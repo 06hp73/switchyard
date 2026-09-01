@@ -790,3 +790,137 @@ def test_corrupt_history_dir_does_not_affect_results(tmp_path, capsys):
     assert (train_dir / "history.jsonl").is_dir()  # untouched, still a directory
     out = capsys.readouterr().out
     assert "history" in out.lower()
+
+
+# --- retry-once + flaky quarantine register (process_branch only) -----------
+#
+# retry_flaky defaults to False at the run_train()/process_branch() level (see
+# the module docstring's "Config" paragraph) so every test above this line -
+# every existing caller that predates this feature - keeps exercising the
+# gate exactly once. These tests opt in explicitly with retry_flaky=True,
+# same as they already do for batch=2, land="pr-squash", etc.
+
+
+def test_retry_flaky_rescues_a_failing_gate_and_logs_it(tmp_path, capsys):
+    origin, station = make_world(tmp_path)
+    counter = tmp_path / "count"
+    # Fails the first time it is ever invoked (counter file does not exist
+    # yet), passes every time after - a one-off flake, not a reproducible
+    # failure. `test -f` + a trailing append is the whole state machine.
+    gate = [
+        "/bin/sh",
+        "-c",
+        f"test -f {counter} && ec=0 || ec=1; echo x >> {counter}; exit $ec",
+    ]
+
+    results = run_train(repo=station, branches=["claude/good"], gate=gate, retry_flaky=True)
+
+    assert results[0].status == "landed"
+    assert results[0].flaky is True
+    assert len(counter.read_text().splitlines()) == 2  # first run + the retry
+
+    out = capsys.readouterr().out
+    assert "FLAKY GATE: landed on retry - signal preserved in flaky_log" in out
+
+    flaky_log = station / ".train" / "flaky_log.jsonl"
+    lines = flaky_log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["gate"] == " ".join(gate)
+    assert entry["tree"]  # non-empty candidate tree hash
+    assert "gate failed" in entry["first_tail"]
+    assert isinstance(entry["ts"], float)
+
+
+def test_retry_flaky_fail_fail_is_rejected_with_both_tails(tmp_path):
+    origin, station = make_world(tmp_path)
+    before = origin_main(origin)
+    counter = tmp_path / "count"
+    gate = ["/bin/sh", "-c", f"echo x >> {counter}; exit 1"]  # deterministic, always red
+
+    results = run_train(repo=station, branches=["claude/good"], gate=gate, retry_flaky=True)
+
+    assert results[0].status == "rejected"
+    assert results[0].flaky is False
+    assert len(counter.read_text().splitlines()) == 2  # first run + the retry
+    detail_lower = results[0].detail.lower()
+    assert "first run" in detail_lower
+    assert "retry run" in detail_lower
+    assert origin_main(origin) == before
+
+    flaky_log = station / ".train" / "flaky_log.jsonl"
+    assert not flaky_log.exists()  # never rescued - nothing to log
+
+
+def test_no_retry_flaky_cli_flag_runs_gate_only_once(tmp_path):
+    # retry_flaky is only ever reached through main()/config or an explicit
+    # run_train(retry_flaky=True) - this drives the real CLI to prove
+    # --no-retry-flaky actually overrides a config that turns it on.
+    origin, station = make_world(tmp_path)
+    counter = tmp_path / "count"
+    gate_script = tmp_path / "gate.sh"
+    gate_script.write_text(f"#!/bin/sh\necho x >> {counter}\nexit 1\n")
+    gate_script.chmod(0o755)
+    config = tmp_path / "switchyard.toml"
+    config.write_text("[switchyard]\nretry_flaky = true\n")
+
+    cli = [
+        sys.executable,
+        str(MERGE_TRAIN_SCRIPT),
+        "run",
+        "--repo",
+        str(station),
+        "--branch",
+        "claude/good",
+        "--gate",
+        str(gate_script),
+        "--no-retry-flaky",
+    ]
+    proc = subprocess.run(
+        cli,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "SWITCHYARD_CONFIG": str(config)},
+    )
+
+    assert proc.returncode == 0, proc.stderr  # a rejected branch is a normal outcome
+    assert len(counter.read_text().splitlines()) == 1
+
+
+def test_timeout_is_never_retried_even_with_retry_flaky_on(tmp_path):
+    origin, station = make_world(tmp_path)
+    counter = tmp_path / "count"
+    gate = ["/bin/sh", "-c", f"echo x >> {counter}; sleep 3"]
+
+    results = run_train(
+        repo=station,
+        branches=["claude/good"],
+        gate=gate,
+        gate_timeout=1,
+        retry_flaky=True,
+    )
+
+    assert results[0].status == "rejected"
+    assert "timed out" in results[0].detail
+    assert len(counter.read_text().splitlines()) == 1  # never retried
+
+
+def test_batch_red_bisection_count_unaffected_by_retry_flaky(tmp_path):
+    # retry_flaky is process_branch-only (see _run_gate_with_retry's
+    # docstring) - passing it through run_train while batch=2 must not touch
+    # _run_batch's gate-run accounting at all, since run_train never forwards
+    # retry_flaky into _run_batch/_run_gate in the first place.
+    origin, station = make_world(tmp_path)
+    counter = tmp_path / "count"
+    gate = [
+        "/bin/sh",
+        "-c",
+        f"echo x >> {counter}; test -f bad.txt && exit 1 || exit 0",
+    ]
+
+    results = run_train(
+        repo=station, branches=["claude/good", "claude/bad"], gate=gate, batch=2, retry_flaky=True
+    )
+
+    assert [r.status for r in results] == ["landed", "rejected"]
+    assert len(counter.read_text().splitlines()) == 3  # AB, A, B - unchanged from batch=2 alone

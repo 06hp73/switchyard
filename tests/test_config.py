@@ -137,6 +137,29 @@ def test_missing_env_pointed_file_warns_and_falls_back_to_defaults(tmp_path, mon
     assert capsys.readouterr().err  # warned, did not silently continue
 
 
+def test_default_retry_flaky_is_true(tmp_path, monkeypatch):
+    # True is the owner-approved default for real (CLI/config-driven) runs -
+    # merge_train.run_train()/process_branch() themselves default this
+    # parameter to False so every caller that predates the feature (every
+    # test that never mentions retry_flaky) keeps running the gate once.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = load_config(tmp_path)
+    assert cfg.retry_flaky is True
+
+
+def test_retry_flaky_can_be_disabled_via_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text("[switchyard]\nretry_flaky = false\n")
+
+    cfg = load_config(repo)
+    assert cfg.retry_flaky is False
+
+
 def test_config_is_frozen():
     cfg = SwitchyardConfig()
     with pytest.raises(dataclasses.FrozenInstanceError):

@@ -80,6 +80,17 @@ main() - run_train() and everything it calls take plain parameters, so
 every existing caller (including every test in this file) that never
 mentions config keeps today's exact hardcoded-default behavior.
 
+Retry-once + flaky quarantine register (process_branch's single-branch
+landing path only - never --batch, see _run_gate_with_retry's docstring):
+when the gate fails for a reason OTHER than a timeout, the identical gate is
+immediately rerun once before the branch is rejected. A rescue (fail then
+pass) still lands the branch, but the failure is never silently thrown
+away: one line is appended to .train/flaky_log.jsonl and a loud warning is
+printed, so a human can look at the evidence and decide whether the test
+that flaked deserves an actual quarantine - a decision this file
+deliberately never makes on its own (see _run_gate_with_retry). Controlled
+by SwitchyardConfig's retry_flaky (default True) / --no-retry-flaky.
+
 State (at the repo root):
     .train/validated_trees.txt  - cache keys (tree hash + gate argv, hashed)
                                   whose gate already passed
@@ -90,6 +101,11 @@ State (at the repo root):
                                   tree, batch, ts) - see _append_history.
                                   Best-effort: a write failure never affects
                                   the TrainResult it was trying to log.
+    .train/flaky_log.jsonl      - one JSON line per gate that failed then
+                                  passed on process_branch's identical retry
+                                  (tree, gate, first_tail, ts) - see
+                                  _append_flaky_log. Same best-effort
+                                  guarantee as history.jsonl.
 
 Usage:
     python tools/train/merge_train.py run [--repo PATH] [--branch NAME ...]
@@ -140,6 +156,9 @@ class TrainResult:
     # rejected/error before a candidate tree ever existed)
     tree: str = ""  # candidate tree hash this result was decided against, "" if none
     batch_size: int = 1  # size of the candidate group this result was decided within
+    flaky: bool = False  # True: this "landed" only after process_branch's identical
+    # gate retry rescued it - see _run_gate_with_retry. Always False for anything
+    # that isn't a landed, single-branch (non-batch) result.
 
     def __eq__(self, other):  # detail/history fields are informational, not identity
         return (
@@ -451,6 +470,95 @@ def _run_gate(
     return None, elapsed
 
 
+def _append_flaky_log(repo: Path, tree: str, gate: list[str], first_detail: str) -> None:
+    """Append one line to .train/flaky_log.jsonl when a gate went red then
+    green on process_branch's identical immediate retry.
+
+    Best-effort, same guarantee as _append_history: a write failure here
+    must never turn a real land into an error. `tree` is the candidate tree
+    hash (not the sha256 cache key) so a human can correlate this file
+    directly against history.jsonl's own "tree" field or validated_trees.txt
+    - `switchyard status`'s FLAKY section (tools/cli.py) already reads
+    exactly this file and needs no changes to start showing real entries.
+    """
+    entry = {
+        "tree": tree,
+        "gate": " ".join(gate),
+        "first_tail": first_detail[-400:],
+        "ts": time.time(),
+    }
+    try:
+        state = _state_dir(repo)
+        with open(state / "flaky_log.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as exc:
+        print(f"train: could not write flaky log ({exc})")
+
+
+def _run_gate_with_retry(
+    repo: Path,
+    gate: list[str],
+    gate_timeout: int,
+    dry_run: bool,
+    key: str,
+    tree: str,
+    retry_flaky: bool,
+) -> tuple[str | None, float, bool]:
+    """process_branch's gate execution: _run_gate, plus one identical retry
+    on a genuine (non-timeout) failure before giving up.
+
+    Chromium's commit queue retries a failing try job once against the exact
+    same configuration before rejecting a CL - a real, reproducible failure
+    fails the same way twice, so the retry costs one gate run and saves a
+    good branch from a one-off flake. Mergify's blind auto-retry is the
+    cautionary counter-example: retrying and landing silently on green
+    LAUNDERS the signal - a real, reproducible bug can slip through
+    disguised as "just flaky", with no trace left for anyone to notice.
+    This keeps Chromium's forgiving behavior (a flaky gate does not block a
+    good branch) while closing Mergify's hole: every retry-rescued land is
+    appended to .train/flaky_log.jsonl (see _append_flaky_log) and printed
+    as a loud warning, so the evidence survives even though the branch
+    landed. Quarantining the actual flaky test remains a HUMAN decision made
+    in the gate definition itself - this file never edits or skips a test on
+    its own; the register plus `switchyard status`'s FLAKY section just hand
+    a human the evidence, and the timestamp gives every entry an implicit
+    expiry (an old, never-repeated one is not worth chasing).
+
+    Only ever called from process_branch. _run_batch calls plain _run_gate
+    directly and must keep doing so: a batch candidate's gate outcome is
+    deterministic in the tree it tests, and test_batch_red_bisects_to_culprit
+    asserts an exact gate-run count for its bisection - retrying there would
+    silently double every red run's count and desync that accounting. Retry-
+    once is deliberately scoped to the single-branch landing path only.
+
+    A timeout is never retried: a hung gate will not run faster the second
+    time, and retrying it only doubles the wait before a rejection the first
+    run already decided.
+
+    Returns (detail, total_elapsed_seconds, flaky) - `flaky` is True only
+    when the first run failed (non-timeout) and the retry then passed.
+    """
+    detail, seconds = _run_gate(repo, gate, gate_timeout, dry_run, key)
+    if detail is None or not retry_flaky or detail.startswith("gate timed out"):
+        return detail, seconds, False
+
+    first_detail = detail
+    retry_detail, retry_seconds = _run_gate(repo, gate, gate_timeout, dry_run, key)
+    total_seconds = seconds + retry_seconds
+
+    if retry_detail is None:
+        print("FLAKY GATE: landed on retry - signal preserved in flaky_log")
+        _append_flaky_log(repo, tree, gate, first_detail)
+        return None, total_seconds, True
+
+    both_tails = (
+        "gate failed twice (retried once, still red):\n"
+        f"--- first run tail ---\n{first_detail[-400:]}\n"
+        f"--- retry run tail ---\n{retry_detail[-400:]}"
+    )
+    return both_tails, total_seconds, False
+
+
 def process_branch(
     repo: Path,
     branch: str,
@@ -459,6 +567,7 @@ def process_branch(
     gate_timeout: int,
     land: str = "push",
     protected: str = "main",
+    retry_flaky: bool = False,
 ) -> TrainResult:
     _git(repo, "fetch", "origin", "--prune")
     _git(repo, "checkout", protected)
@@ -497,18 +606,31 @@ def process_branch(
     tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
 
     key = _cache_key(tree, gate)
-    gate_detail, gate_seconds = _run_gate(repo, gate, gate_timeout, dry_run, key)
+    gate_detail, gate_seconds, gate_flaky = _run_gate_with_retry(
+        repo, gate, gate_timeout, dry_run, key, tree, retry_flaky
+    )
     if gate_detail is not None:
         _git(repo, "reset", "--hard", f"origin/{protected}")
         return TrainResult(branch, "rejected", gate_detail, gate_seconds, tree)
 
     if dry_run:
         _git(repo, "reset", "--hard", f"origin/{protected}")
-        return TrainResult(branch, "landed", "dry-run: validated, not pushed", gate_seconds, tree)
+        return TrainResult(
+            branch,
+            "landed",
+            "dry-run: validated, not pushed",
+            gate_seconds,
+            tree,
+            flaky=gate_flaky,
+        )
 
     if land == "pr-squash":
         result = _land_via_pr_squash(repo, branch, tree, head_sha, protected)
-        return dataclasses.replace(result, gate_seconds=gate_seconds, tree=tree)
+        # gh can still fail the actual squash after a flaky-rescued gate pass
+        # (no open PR, head moved, ...) - flaky must only ever describe a
+        # landed result, never a rejected/error one riding gate_flaky along.
+        landed_flaky = gate_flaky and result.status == "landed"
+        return dataclasses.replace(result, gate_seconds=gate_seconds, tree=tree, flaky=landed_flaky)
 
     push = _git(repo, "push", "origin", protected, check=False)
     if push.returncode != 0:
@@ -516,7 +638,7 @@ def process_branch(
         return TrainResult(
             branch, "error", f"push failed: {push.stderr.strip()[:400]}", gate_seconds, tree
         )
-    return TrainResult(branch, "landed", "", gate_seconds, tree)
+    return TrainResult(branch, "landed", "", gate_seconds, tree, flaky=gate_flaky)
 
 
 # --- Batch mode (--batch N) -------------------------------------------------
@@ -782,6 +904,7 @@ def run_train(
     batch: int = 1,
     protected: str = "main",
     priority_label: str = "train-priority",
+    retry_flaky: bool = False,
 ) -> list[TrainResult]:
     repo = Path(repo).resolve()
     batch = max(1, batch)
@@ -798,7 +921,14 @@ def run_train(
                 branch_gate = gate_factory(branch) if gate_factory else gate
                 try:
                     result = process_branch(
-                        repo, branch, branch_gate, dry_run, gate_timeout, land, protected
+                        repo,
+                        branch,
+                        branch_gate,
+                        dry_run,
+                        gate_timeout,
+                        land,
+                        protected,
+                        retry_flaky,
                     )
                 except Exception as exc:  # noqa: BLE001 - one broken branch must not stall the queue
                     result = TrainResult(branch, "error", f"{type(exc).__name__}: {exc}")
@@ -855,6 +985,12 @@ def main() -> int:
     run_parser.add_argument("--land", choices=["push", "pr-squash"], default="push")
     run_parser.add_argument("--batch", type=int, default=None)
     run_parser.add_argument("--dry-run", action="store_true")
+    run_parser.add_argument(
+        "--no-retry-flaky",
+        action="store_true",
+        help="disable process_branch's identical-gate retry-once on failure "
+        "(overrides switchyard.toml's retry_flaky for this run only)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.repo)
@@ -866,6 +1002,7 @@ def main() -> int:
         gate = GATE_DEFAULT
     gate_timeout = args.gate_timeout if args.gate_timeout is not None else cfg.gate_timeout
     batch = args.batch if args.batch is not None else cfg.batch
+    retry_flaky = cfg.retry_flaky and not args.no_retry_flaky
 
     results = run_train(
         repo=args.repo,
@@ -877,6 +1014,7 @@ def main() -> int:
         batch=batch,
         protected=cfg.protected_branch,
         priority_label=cfg.priority_label,
+        retry_flaky=retry_flaky,
     )
     # rejected/conflict are NORMAL train outcomes (the queue did its job);
     # only a system error is a failing exit for cron/loop wrappers. Under
