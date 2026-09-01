@@ -228,7 +228,7 @@ of crashing — a broken config must never brick a guard. See
 
 ## Tests
 
-243 tests, plain pytest, no project dependencies (needs Python 3.11+ for
+246 tests, plain pytest, no project dependencies (needs Python 3.11+ for
 `tomllib` — see `tools/lib/switchyard_config.py`):
 
 ```bash
