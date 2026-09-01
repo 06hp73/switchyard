@@ -130,7 +130,6 @@ import hashlib
 import json
 import os
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -231,26 +230,106 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _acquire_lock(repo: Path) -> Path:
-    lock = _state_dir(repo) / "lock"
+def _read_pid(pid_file: Path) -> int | None:
     try:
-        lock.mkdir()
-    except FileExistsError:
-        pid_file = lock / "pid"
+        return int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _acquire_lock(repo: Path) -> Path:
+    """Take the train's mutex: an O_EXCL-created .train/lock/pid file.
+
+    The PID FILE is the actual mutex, not the containing directory. The
+    previous scheme (mkdir the lock dir, THEN write a pid file inside it as
+    a separate step) had a real TOCTOU window between those two steps: a
+    second process could see the directory already exists, find no pid file
+    written yet (or race a stale one), decide the lock was abandoned, and
+    rmtree+recreate it out from under a process that was still
+    mid-acquisition - proven exploitable in review (both trains then push
+    the protected branch, and whichever `finally` runs first deletes the
+    other's lock). `os.open(path, O_CREAT | O_EXCL | O_WRONLY)` creates the
+    file and checks exclusivity in one atomic kernel call, closing that
+    window entirely: only one process can ever win that create for a given
+    path, full stop.
+
+    On losing that race (FileExistsError): read whoever's pid is in there. A
+    live holder is a normal, clean refusal (SystemExit - same message as
+    before). A dead/unreadable holder means the previous run crashed without
+    cleaning up - reclaim by unlinking the stale pid file and retrying the
+    SAME atomic create exactly once. If that retry ALSO loses the race, some
+    other process reclaimed it first in the meantime; rather than loop
+    (which could spin forever under contention), that is simply treated as
+    "held" and refused, same as an ordinary live holder.
+
+    The directory itself (repo/.train/lock) is still created first (mkdir
+    with exist_ok=True) purely as the pid file's container - it carries no
+    locking semantics of its own anymore, so two processes racing on that
+    mkdir is harmless (exist_ok=True lets both succeed).
+    """
+    lock = _state_dir(repo) / "lock"
+    lock.mkdir(exist_ok=True)
+    pid_file = lock / "pid"
+
+    def try_create() -> bool:
         try:
-            holder = int(pid_file.read_text().strip())
-        except (OSError, ValueError):
-            holder = None
-        if holder is not None and _pid_alive(holder):
-            raise SystemExit(
-                f"another train run holds .train/lock (held by pid {holder}; "
-                "remove .train/lock if certain no train runs)"
-            ) from None
-        print(f"reclaimed stale train lock (pid {holder} dead)")
-        shutil.rmtree(lock, ignore_errors=True)
-        lock.mkdir()
-    (lock / "pid").write_text(str(os.getpid()))
-    return lock
+            fd = os.open(pid_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+        return True
+
+    if try_create():
+        return lock
+
+    holder = _read_pid(pid_file)
+    if holder is not None and _pid_alive(holder):
+        raise SystemExit(
+            f"another train run holds .train/lock (held by pid {holder}; "
+            "remove .train/lock if certain no train runs)"
+        ) from None
+
+    print(f"reclaimed stale train lock (pid {holder} dead)")
+    try:
+        os.unlink(pid_file)
+    except FileNotFoundError:
+        pass  # already gone - the retry below decides who actually wins it
+
+    if try_create():
+        return lock
+
+    # Lost the reclaim race too: another process's create won between our
+    # unlink and our retry. Whatever it wrote is the live lock now - refuse
+    # rather than loop, exactly like an ordinary live-holder refusal.
+    holder = _read_pid(pid_file)
+    raise SystemExit(
+        f"another train run holds .train/lock (held by pid {holder}; "
+        "remove .train/lock if certain no train runs)"
+    ) from None
+
+
+def _release_lock(lock: Path) -> None:
+    """Release the train mutex: remove the pid file (the actual lock), then
+    tidy up the now-empty container directory.
+
+    Order matters: unlinking the pid file first is what actually frees the
+    mutex for the next acquirer. The directory removal after that is pure
+    tidiness and must never raise - rmdir refuses a non-empty directory
+    (e.g. a racing reclaimer recreated a pid file the instant after we
+    removed ours) and that is fine, there is nothing to clean up in that
+    case.
+    """
+    try:
+        (lock / "pid").unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        lock.rmdir()
+    except OSError:
+        pass
 
 
 def _cache_key(tree: str, gate: list[str]) -> str:
@@ -1008,7 +1087,7 @@ def run_train(
                     _append_history(repo, result)
                     _notify_result(branch, result, notify_mode)
     finally:
-        shutil.rmtree(lock, ignore_errors=True)
+        _release_lock(lock)
     counts: dict[str, int] = {}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1

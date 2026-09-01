@@ -179,6 +179,87 @@ def test_live_lock_refuses(tmp_path):
         run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"])
 
 
+# --- lock mutual exclusion (C2: the pid file itself is the mutex) -----------
+
+
+def test_acquire_lock_live_pid_refuses(tmp_path):
+    from merge_train import _acquire_lock
+
+    lock_dir = tmp_path / ".train" / "lock"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "pid").write_text(str(os.getpid()))
+
+    with pytest.raises(SystemExit):
+        _acquire_lock(tmp_path)
+
+
+def test_acquire_lock_dead_pid_reclaims_and_proceeds(tmp_path):
+    from merge_train import _acquire_lock
+
+    lock_dir = tmp_path / ".train" / "lock"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "pid").write_text("99999999")
+
+    lock = _acquire_lock(tmp_path)
+
+    assert lock == lock_dir
+    assert int((lock_dir / "pid").read_text().strip()) == os.getpid()
+
+
+def test_acquire_lock_is_mutually_exclusive_until_released(tmp_path):
+    # The pid file itself is the mutex (an O_EXCL atomic create), not just
+    # the containing directory existing: two sequential acquires on the same
+    # repo with no release in between must refuse the second - proving real
+    # exclusion, not just "a directory happens to be there already".
+    from merge_train import _acquire_lock, _release_lock
+
+    lock = _acquire_lock(tmp_path)
+
+    with pytest.raises(SystemExit):
+        _acquire_lock(tmp_path)
+
+    _release_lock(lock)
+
+    # Released: a subsequent acquire must succeed again.
+    lock2 = _acquire_lock(tmp_path)
+    assert lock2 == lock
+    _release_lock(lock2)
+
+
+def test_acquire_lock_reclaim_race_loss_is_treated_as_held(tmp_path, monkeypatch):
+    # Simulates the exact race the atomic-pidfile fix exists to close: a
+    # dead holder is found (eligible for reclaim), but between our unlink of
+    # its stale pidfile and our own retry create, another reclaimer wins
+    # first. Our retry's O_EXCL create must then lose for real (not silently
+    # succeed and hand out a second lock) and we must refuse cleanly - never
+    # an uncaught FileExistsError bubbling out of a "concurrent reclaimers"
+    # race.
+    from merge_train import _acquire_lock
+
+    lock_dir = tmp_path / ".train" / "lock"
+    lock_dir.mkdir(parents=True)
+    pid_file = lock_dir / "pid"
+    pid_file.write_text("99999999")  # dead - eligible for reclaim
+
+    real_open = os.open
+    target = str(pid_file)
+    calls = {"n": 0}
+
+    def racy_open(path, *args, **kwargs):
+        if str(path) == target:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # A concurrent reclaimer wins the race right before our own
+                # retry create runs - it should see this and lose too.
+                Path(path).write_text(str(os.getpid()))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", racy_open)
+
+    with pytest.raises(SystemExit):
+        _acquire_lock(tmp_path)
+
+
 def test_missing_gate_binary_is_error_and_queue_continues(tmp_path):
     origin, station = make_world(tmp_path)
     results = run_train(
