@@ -114,6 +114,175 @@ def test_unknown_key_warns_but_known_keys_still_apply(tmp_path, monkeypatch, cap
     assert "not_a_real_key" in err
 
 
+# --- I8: config values are type-checked/coerced, never trusted verbatim ---
+#
+# dataclasses do not enforce their own type hints at construction time, so
+# without coercion a TOML author's typo flows straight into a frozen
+# SwitchyardConfig unchanged: gate_timeout = "5400" (a quoted string) later
+# breaks subprocess.Popen.communicate(timeout=...), which requires a real
+# number; live_prefixes = "claude/" (a bare string instead of an array)
+# silently becomes a per-CHARACTER tuple via tuple("claude/") wherever a
+# caller does tuple(cfg.live_prefixes). Each bad key must warn and fall back
+# to THAT field's own default - never raise, and never take any other,
+# validly-configured key down with it.
+
+
+def test_gate_timeout_numeric_string_is_coerced_to_int(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\ngate_timeout = "5400"\n')
+
+    cfg = load_config(repo)
+    assert cfg.gate_timeout == 5400
+    assert isinstance(cfg.gate_timeout, int)
+
+
+def test_gate_timeout_non_numeric_string_warns_and_falls_back_to_default(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\ngate_timeout = "soon-ish"\n')
+
+    cfg = load_config(repo)
+    assert cfg.gate_timeout == 5400  # the field's own default, not a crash
+    err = capsys.readouterr().err
+    assert "gate_timeout" in err
+
+
+def test_batch_numeric_string_is_coerced_to_int(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\nbatch = "3"\n')
+
+    cfg = load_config(repo)
+    assert cfg.batch == 3
+    assert isinstance(cfg.batch, int)
+
+
+def test_wip_cap_bool_warns_and_falls_back_to_default(tmp_path, monkeypatch, capsys):
+    # bool is a subclass of int in Python - true/false must not sneak
+    # through an int field as 1/0.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text("[switchyard]\nwip_cap = true\n")
+
+    cfg = load_config(repo)
+    assert cfg.wip_cap == 5
+    err = capsys.readouterr().err
+    assert "wip_cap" in err
+
+
+def test_retry_flaky_non_bool_warns_and_falls_back_to_default(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\nretry_flaky = "yes"\n')
+
+    cfg = load_config(repo)
+    assert cfg.retry_flaky is True  # the field's own default
+    err = capsys.readouterr().err
+    assert "retry_flaky" in err
+
+
+def test_live_prefixes_scalar_string_ending_in_slash_wraps_as_one_prefix(
+    tmp_path, monkeypatch, capsys
+):
+    # The exact scenario named in the audit: a config author writes
+    # live_prefixes = "claude/" (forgetting the brackets) instead of
+    # ["claude/"]. tuple("claude/") would silently produce a per-character
+    # tuple; this must instead warn and wrap it as one prefix.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\nlive_prefixes = "claude/"\n')
+
+    cfg = load_config(repo)
+    assert cfg.live_prefixes == ("claude/",)
+    err = capsys.readouterr().err
+    assert "live_prefixes" in err
+
+
+def test_live_prefixes_scalar_string_not_a_prefix_falls_back_to_default(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\nlive_prefixes = "oops"\n')
+
+    cfg = load_config(repo)
+    assert cfg.live_prefixes == ("claude/", "fix/", "feat/")
+    err = capsys.readouterr().err
+    assert "live_prefixes" in err
+
+
+def test_live_prefixes_list_with_non_string_element_falls_back_to_default(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text("[switchyard]\nlive_prefixes = [1, 2]\n")
+
+    cfg = load_config(repo)
+    assert cfg.live_prefixes == ("claude/", "fix/", "feat/")
+    err = capsys.readouterr().err
+    assert "live_prefixes" in err
+
+
+def test_station_non_string_falls_back_to_default(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text("[switchyard]\nstation = 5\n")
+
+    cfg = load_config(repo)
+    assert cfg.station == ""
+    err = capsys.readouterr().err
+    assert "station" in err
+
+
+def test_one_bad_typed_key_does_not_break_other_keys(tmp_path, monkeypatch, capsys):
+    # A typo'd gate_timeout must not take a validly-configured wip_cap down
+    # with it - each key is coerced (and, on failure, defaulted)
+    # independently.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\ngate_timeout = "nope"\nwip_cap = 9\n')
+
+    cfg = load_config(repo)
+    assert cfg.wip_cap == 9
+    assert cfg.gate_timeout == 5400
+    err = capsys.readouterr().err
+    assert "gate_timeout" in err
+
+
 def test_live_prefixes_array_parses_to_a_tuple(tmp_path, monkeypatch):
     monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))

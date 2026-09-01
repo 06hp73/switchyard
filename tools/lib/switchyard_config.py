@@ -84,12 +84,85 @@ def _find_git_toplevel(start: Path) -> Path | None:
     return None
 
 
-def _coerce(field: dataclasses.Field, value: object) -> object:
-    """TOML arrays decode as lists; live_prefixes' default (and every other
-    consumer's expectations, e.g. str.startswith(prefixes)) is a tuple."""
-    if field.name == "live_prefixes" and isinstance(value, list):
-        return tuple(value)
-    return value
+# Fields whose declared type is int / bool respectively - see _coerce.
+# live_prefixes gets its own dedicated branch below (tuple[str, ...], not a
+# plain scalar type), and every other field is a plain str.
+_INT_FIELDS = frozenset({"gate_timeout", "wip_cap", "batch", "deps_age_days"})
+_BOOL_FIELDS = frozenset({"retry_flaky"})
+
+
+class _Invalid:
+    """Sentinel returned by `_coerce` when a raw TOML value cannot be
+    coerced to its field's declared type. The caller drops the key entirely
+    so SwitchyardConfig's own default for that ONE field applies - a typo in
+    one key must never take any other, validly-configured key down with
+    it."""
+
+    def __repr__(self) -> str:
+        return "<invalid>"
+
+
+_INVALID = _Invalid()
+
+
+def _coerce(field: dataclasses.Field, value: object, path: Path) -> object:
+    """Coerce `value` (already TOML-decoded) to `field`'s declared type.
+
+    TOML lets an author write any scalar/array for any key regardless of
+    what SwitchyardConfig declares - e.g. gate_timeout = "5400" (a quoted
+    string; breaks subprocess.Popen.communicate(timeout=...) later, which
+    requires a real number) or live_prefixes = "claude/" (a bare string
+    instead of an array; tuple("claude/") would silently produce a
+    per-CHARACTER tuple). dataclasses do not enforce their own type hints at
+    construction time, so without this step a bad value flows straight into
+    a frozen SwitchyardConfig unchanged. Returns `_INVALID` (after a
+    warning) rather than raising - the caller must then omit the key so the
+    dataclass's own default for that field applies.
+    """
+    name = field.name
+
+    if name in _BOOL_FIELDS:
+        if isinstance(value, bool):
+            return value
+        _warn(f"'{name}' in {path} must be true/false, got {value!r}; using default")
+        return _INVALID
+
+    if name in _INT_FIELDS:
+        # bool is a subclass of int in Python - true/false must not sneak
+        # through an int field (e.g. wip_cap = true) as 1/0.
+        if isinstance(value, bool):
+            _warn(f"'{name}' in {path} must be an integer, got {value!r}; using default")
+            return _INVALID
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                _warn(f"'{name}' in {path} must be an integer, got {value!r}; using default")
+                return _INVALID
+        _warn(f"'{name}' in {path} must be an integer, got {value!r}; using default")
+        return _INVALID
+
+    if name == "live_prefixes":
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return tuple(value)
+        if isinstance(value, str) and value.endswith("/"):
+            _warn(
+                f"'{name}' in {path} is a single string {value!r}, not a list; "
+                "treating it as one prefix - wrap it in [ ... ] to silence this warning"
+            )
+            return (value,)
+        _warn(f"'{name}' in {path} must be a list of strings, got {value!r}; using default")
+        return _INVALID
+
+    # Every remaining field (protected_branch, product_remote_match, python,
+    # station, gate_fast, gate_full, priority_label, notify, worktree_dir,
+    # branch_prefix) is a plain str.
+    if isinstance(value, str):
+        return value
+    _warn(f"'{name}' in {path} must be a string, got {value!r}; using default")
+    return _INVALID
 
 
 def _load_from_path(path: Path) -> SwitchyardConfig:
@@ -119,7 +192,10 @@ def _load_from_path(path: Path) -> SwitchyardConfig:
         if field is None:
             _warn(f"unknown config key '{key}' in {path}; ignoring")
             continue
-        kwargs[key] = _coerce(field, value)
+        coerced = _coerce(field, value, path)
+        if coerced is _INVALID:
+            continue
+        kwargs[key] = coerced
 
     try:
         return SwitchyardConfig(**kwargs)
