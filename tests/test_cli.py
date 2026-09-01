@@ -129,6 +129,48 @@ def test_status_defaults_to_notify_none(tmp_path):
     assert "notify: none" in proc.stdout
 
 
+def test_status_flaky_section_shows_branch_and_tail_not_a_json_blob(tmp_path):
+    # B4: _append_flaky_log now records which branch a retry-rescued gate
+    # actually judged (see test_merge_train.py's flaky-log tests) - this
+    # checks the OTHER half, that `switchyard status`'s FLAKY section
+    # renders it as "branch - test tail (age)" instead of falling all the
+    # way back to dumping the raw JSON entry (its old behavior, since
+    # "branch" never used to be there for it to find).
+    _origin, station = make_world(tmp_path)
+    train_dir = station / ".train"
+    train_dir.mkdir(exist_ok=True)
+    entry = {
+        "branch": "claude/flaky-one",
+        "tree": "abc123",
+        "gate": "bash tools/train/gate.sh",
+        "first_tail": "AssertionError: boom in test_thing.py",
+        "ts": time.time(),
+    }
+    (train_dir / "flaky_log.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+    proc = run_cli("status", "--repo", str(station), home=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "claude/flaky-one - AssertionError: boom in test_thing.py" in proc.stdout
+    assert '"branch"' not in proc.stdout  # never the raw JSON dump when branch IS present
+
+
+def test_status_flaky_section_degrades_gracefully_for_pre_fix_entries(tmp_path):
+    # A flaky_log.jsonl line written before B4 has no "branch" key at all -
+    # the exact shape that used to render as a raw JSON blob. Must still
+    # degrade to SOME readable label, never crash the whole status view.
+    _origin, station = make_world(tmp_path)
+    train_dir = station / ".train"
+    train_dir.mkdir(exist_ok=True)
+    entry = {"tree": "abc123", "gate": "x", "first_tail": "boom", "ts": time.time()}
+    (train_dir / "flaky_log.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+    proc = run_cli("status", "--repo", str(station), home=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
 def test_status_shows_configured_notify_mode(tmp_path):
     origin, station = make_world(tmp_path)
     (station / "switchyard.toml").write_text('[switchyard]\nnotify = "macos"\n')
@@ -229,6 +271,50 @@ def test_stats_handles_missing_history_file(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert "Traceback" not in proc.stderr
+
+
+# --- switchyard stats --days validation (B2: --days 0 used to ZeroDivisionError) --
+
+
+def test_stats_days_zero_rejected_with_a_clean_error_not_a_traceback(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    proc = run_cli("stats", "--repo", str(repo), "--days", "0", home=tmp_path)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert "ZeroDivisionError" not in proc.stderr
+    assert "--days" in proc.stderr
+
+
+def test_stats_days_negative_rejected_with_a_clean_error(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    proc = run_cli("stats", "--repo", str(repo), "--days", "-5", home=tmp_path)
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_cmd_stats_clamps_non_positive_days_when_called_directly(tmp_path, capsys):
+    # Defense in depth for any caller that builds its own Namespace and
+    # calls cmd_stats directly, bypassing argparse's own --days validation
+    # (_positive_days) entirely - must still never hit the ZeroDivisionError
+    # `landed / days` used to raise for days <= 0 (cli.py's cmd_stats).
+    import argparse
+
+    sys.path.insert(0, str(CLI_SCRIPT.parent))
+    import cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    rc = cli.cmd_stats(argparse.Namespace(repo=repo, days=0))
+
+    assert rc == 0
+    assert "last 1 day(s)" in capsys.readouterr().out
 
 
 # --- switchyard radar / land (thin passthroughs) ------------------------------

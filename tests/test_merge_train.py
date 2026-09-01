@@ -245,6 +245,36 @@ def test_lock_migrates_legacy_directory_lock(tmp_path):
         _release_lock(lock)
 
 
+def test_lock_migration_survives_concurrent_rmtree_race(tmp_path, monkeypatch):
+    # Two processes can both see the legacy lock directory and both attempt
+    # this one-time dir->file migration (see _acquire_lock's docstring);
+    # whichever loses the race calls shutil.rmtree on a path the other
+    # process already removed, which raises FileNotFoundError unless
+    # ignore_errors=True (B6). Simulated deterministically here by having
+    # the directory vanish - as a "racing" process would - in the instant
+    # between _acquire_lock's own is_dir() check and its rmtree() call.
+    from merge_train import _acquire_lock, _release_lock
+
+    legacy = tmp_path / ".train" / "lock"
+    legacy.mkdir(parents=True)
+
+    real_is_dir = Path.is_dir
+
+    def _is_dir_then_vanish(self):
+        seen = real_is_dir(self)
+        if seen and self == legacy:
+            legacy.rmdir()  # the "other process" wins the race right here
+        return seen
+
+    monkeypatch.setattr(Path, "is_dir", _is_dir_then_vanish)
+
+    lock = _acquire_lock(tmp_path)
+    try:
+        assert (tmp_path / ".train" / "lock").is_file()
+    finally:
+        _release_lock(lock)
+
+
 def test_lock_survives_holder_crash(tmp_path):
     # SIGKILLing the holder proves the whole stale-lock class is gone: the
     # kernel drops a flock unconditionally the instant the last fd
@@ -1282,6 +1312,7 @@ def test_retry_flaky_rescues_a_failing_gate_and_logs_it(tmp_path, capsys):
     lines = flaky_log.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     entry = json.loads(lines[0])
+    assert entry["branch"] == "claude/good"  # B4: the culprit branch, not omitted
     assert entry["gate"] == " ".join(gate)
     assert entry["tree"]  # non-empty candidate tree hash
     assert "gate failed" in entry["first_tail"]
@@ -1450,6 +1481,7 @@ def test_batch_retry_flaky_rescues_the_size_one_leaf_and_logs_it(tmp_path):
     lines = flaky_log.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     entry = json.loads(lines[0])
+    assert entry["branch"] == "claude/bad"  # B4: the size-1 leaf's own culprit, not "good"
     assert "gate failed" in entry["first_tail"]
 
 

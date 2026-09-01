@@ -107,7 +107,7 @@ State (at the repo root):
                                   the TrainResult it was trying to log.
     .train/flaky_log.jsonl      - one JSON line per gate that failed then
                                   passed on process_branch's identical retry
-                                  (tree, gate, first_tail, ts) - see
+                                  (branch, tree, gate, first_tail, ts) - see
                                   _append_flaky_log. Same best-effort
                                   guarantee as history.jsonl.
 
@@ -273,7 +273,13 @@ def _acquire_lock(repo: Path) -> TextIO:
     """
     lock_path = _state_dir(repo) / "lock"
     if lock_path.is_dir():
-        shutil.rmtree(lock_path)
+        # ignore_errors: two processes can both see is_dir() True and both
+        # attempt this one-time dir->file upgrade - whichever loses that
+        # race hits FileNotFoundError (or similar) removing what the other
+        # already removed. This migration is already best-effort (see the
+        # docstring above); losing the race here must never crash the
+        # process, only the flock acquired below matters for correctness.
+        shutil.rmtree(lock_path, ignore_errors=True)
 
     f = open(lock_path, "a+")
     try:
@@ -592,18 +598,24 @@ def _run_gate(
     return None, elapsed
 
 
-def _append_flaky_log(repo: Path, tree: str, gate: list[str], first_detail: str) -> None:
+def _append_flaky_log(
+    repo: Path, branch: str, tree: str, gate: list[str], first_detail: str
+) -> None:
     """Append one line to .train/flaky_log.jsonl when a gate went red then
     green on process_branch's identical immediate retry.
 
     Best-effort, same guarantee as _append_history: a write failure here
-    must never turn a real land into an error. `tree` is the candidate tree
-    hash (not the sha256 cache key) so a human can correlate this file
-    directly against history.jsonl's own "tree" field or validated_trees.txt
-    - `switchyard status`'s FLAKY section (tools/cli.py) already reads
-    exactly this file and needs no changes to start showing real entries.
+    must never turn a real land into an error. `branch` is the single
+    culprit branch this retry judged alone - process_branch's own branch for
+    the single-branch path, or the size-1 bisected leaf's sole member for
+    the batch path (see _run_gate_with_retry) - so `switchyard status`'s
+    FLAKY section (tools/cli.py) can name it instead of falling back to
+    dumping the raw entry. `tree` is the candidate tree hash (not the
+    sha256 cache key) so a human can correlate this file directly against
+    history.jsonl's own "tree" field or validated_trees.txt.
     """
     entry = {
+        "branch": branch,
         "tree": tree,
         "gate": " ".join(gate),
         "first_tail": first_detail[-400:],
@@ -619,6 +631,7 @@ def _append_flaky_log(repo: Path, tree: str, gate: list[str], first_detail: str)
 
 def _run_gate_with_retry(
     repo: Path,
+    branch: str,
     gate: list[str],
     gate_timeout: int,
     dry_run: bool,
@@ -628,6 +641,11 @@ def _run_gate_with_retry(
 ) -> tuple[str | None, float, bool]:
     """process_branch's gate execution: _run_gate, plus one identical retry
     on a genuine (non-timeout) failure before giving up.
+
+    `branch` is the single culprit this call is judging alone - forwarded
+    to _append_flaky_log on a rescue so the register (and `switchyard
+    status`'s FLAKY section) can name it instead of falling back to a raw
+    JSON dump (see _append_flaky_log's own docstring).
 
     Chromium's commit queue retries a failing try job once against the exact
     same configuration before rejecting a CL - a real, reproducible failure
@@ -677,7 +695,7 @@ def _run_gate_with_retry(
 
     if retry_detail is None:
         print("FLAKY GATE: landed on retry - signal preserved in flaky_log")
-        _append_flaky_log(repo, tree, gate, first_detail)
+        _append_flaky_log(repo, branch, tree, gate, first_detail)
         return None, total_seconds, True
 
     both_tails = (
@@ -736,7 +754,7 @@ def process_branch(
 
     key = _cache_key(tree, gate)
     gate_detail, gate_seconds, gate_flaky = _run_gate_with_retry(
-        repo, gate, gate_timeout, dry_run, key, tree, retry_flaky
+        repo, branch, gate, gate_timeout, dry_run, key, tree, retry_flaky
     )
     if gate_detail is not None:
         _git(repo, "reset", "--hard", f"origin/{protected}")
@@ -999,7 +1017,7 @@ def _run_batch(
     is_leaf = len(built) == 1
     if is_leaf:
         gate_detail, gate_seconds, gate_flaky = _run_gate_with_retry(
-            repo, gate, gate_timeout, dry_run, key, tree, retry_flaky
+            repo, built[0], gate, gate_timeout, dry_run, key, tree, retry_flaky
         )
     else:
         gate_detail, gate_seconds = _run_gate(repo, gate, gate_timeout, dry_run, key)

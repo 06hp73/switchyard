@@ -80,6 +80,20 @@ from switchyard_config import load_config
 DEFAULT_STATS_DAYS = 14
 
 
+def _positive_days(value: str) -> int:
+    """argparse `type=` for `stats --days`: a clean, immediate error instead
+    of letting `--days 0` (or a negative count) reach cmd_stats's own
+    `landed / days` landing-rate math, which raises ZeroDivisionError for
+    days=0 (and prints a nonsensical negative-window result for days<0).
+    Raising ValueError/ArgumentTypeError here is what argparse itself
+    catches to render "invalid _positive_days value" / this message as a
+    normal usage error (exit 2), not a traceback."""
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"--days must be >= 1 (got {parsed})")
+    return parsed
+
+
 def _humanize_age(seconds: float) -> str:
     seconds = max(0.0, seconds)
     if seconds < 60:
@@ -190,10 +204,11 @@ def _print_queue_section(repo: Path, cfg) -> None:
 
 
 def _print_flaky_section(repo: Path) -> None:
-    # merge_train.py's process_branch writes one line here per gate that
-    # failed then passed on an identical immediate retry (see
-    # _append_flaky_log) - this only ever reads it, defensively, and renders
-    # whatever is there.
+    # merge_train.py's process_branch (and _run_batch's size-1 bisected
+    # leaf) writes one line here per gate that failed then passed on an
+    # identical immediate retry (see _append_flaky_log, which records the
+    # single culprit branch that retry judged) - this only ever reads it,
+    # defensively, and renders whatever is there.
     entries = _read_jsonl(repo / ".train" / "flaky_log.jsonl")
     if entries is None:
         print("  no flaky log yet (.train/flaky_log.jsonl not present)")
@@ -203,12 +218,18 @@ def _print_flaky_section(repo: Path) -> None:
         return
     now = time.time()
     for entry in entries[-10:]:
-        label = entry.get("branch") or entry.get("test") or entry.get("name")
-        if label is None:
-            label = json.dumps(entry)[:60]
+        # "branch" is B4's fix - every entry written from here on has one.
+        # A pre-fix entry (written before flaky_log.jsonl started recording
+        # it) has none, so degrade to the old best-effort label rather than
+        # claim a name that was never captured.
+        branch = entry.get("branch") or entry.get("test") or entry.get("name")
+        if branch is None:
+            branch = json.dumps(entry)[:60]
+        first_tail = entry.get("first_tail") or ""
+        tail_line = first_tail.splitlines()[0][:120] if first_tail else "(no detail)"
         ts = entry.get("ts")
         age = _humanize_age(now - ts) if isinstance(ts, (int, float)) else "unknown age"
-        print(f"    {label} ({age} ago)")
+        print(f"    {branch} - {tail_line} ({age} ago)")
 
 
 def _print_last_landings_section(repo: Path) -> None:
@@ -272,7 +293,11 @@ def _percentile(sorted_values: list[float], pct: float) -> float:
 
 def cmd_stats(args: argparse.Namespace) -> int:
     repo = args.repo.resolve()
-    days = args.days
+    # Clamped, not just validated at the argparse layer (see _positive_days
+    # below): a caller that builds its own Namespace and invokes cmd_stats
+    # directly - bypassing argparse's own type check entirely - must never
+    # hit the ZeroDivisionError `landed / days` used to raise for days <= 0.
+    days = max(1, args.days)
     print(f"switchyard stats - last {days} day(s)")
 
     entries = _read_jsonl(repo / ".train" / "history.jsonl")
@@ -936,7 +961,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stats = sub.add_parser("stats", help="landing-history stats from .train/history.jsonl")
     p_stats.add_argument("--repo", type=Path, default=Path.cwd())
-    p_stats.add_argument("--days", type=int, default=DEFAULT_STATS_DAYS)
+    p_stats.add_argument("--days", type=_positive_days, default=DEFAULT_STATS_DAYS)
     p_stats.set_defaults(func=cmd_stats)
 
     # radar/land are listed here only so `switchyard --help` shows them -
