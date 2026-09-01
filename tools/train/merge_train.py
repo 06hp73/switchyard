@@ -897,31 +897,58 @@ def _land_batch_pr_squash(
     than guessing whether landing them now, on top of a main that only
     partially matches what was gate-tested, would be safe.
 
-    On a clean run through every member, origin/main is fetched once and its
-    tree is checked against `validated_tree` - the ONE thing this whole
-    group was actually gated against. A mismatch does not roll anything
-    back (every member really did land); it is reported as a loud error
-    attached to the last member. This is the design's explicit tradeoff:
-    the intermediate main states between members were never individually
-    gated, only this final combined state was - see the module docstring's
-    "Batch mode" section.
+    Both the clean and the partial-failure path re-fetch origin before
+    resetting the local checkout: gh squashes land server-side against the
+    BARE origin directly, never through this local clone, so the local
+    repo's own remote-tracking origin/<protected> is stale the instant the
+    first member lands - resetting against it without fetching first would
+    silently discard the checkout back to whatever main was BEFORE this
+    batch, even though members really did land on the real origin.
+
+    Both paths also compare the freshly-fetched origin/<protected>^{tree}
+    against `validated_tree` - the ONE thing this whole group was actually
+    gated against - but interpret a mismatch differently depending on which
+    path found it. On a clean run through every member, `validated_tree` was
+    gated against exactly what should now be on origin, so a mismatch there
+    is unexplained and reported as a loud error attached to the last member
+    ("batch landed but tree mismatch - INVESTIGATE"). On the partial-failure
+    path, `validated_tree` was gated against the FULL candidate (every
+    member, including the one that failed and everything queued behind it),
+    so falling short of it is simply the expected, unavoidable shape of a
+    partial landing, not a mystery - every already-landed member's result
+    instead carries a "partial batch - combined tree not fully realized;
+    verify" note, never a false clean "landed" with no caveat and never the
+    all-members-landed error text (that specific wording is reserved for the
+    genuinely unexplained clean-run case above). This is the design's
+    explicit tradeoff: the intermediate main states between members were
+    never individually gated, only the fully-combined candidate was - see
+    the module docstring's "Batch mode" section.
     """
     gh = _gh_exe()
-    results: list[TrainResult] = []
+    landed_branches: list[str] = []
     for idx, branch in enumerate(built):
         failure = _squash_one(repo, gh, branch, head_shas[branch], protected)
         if failure is not None:
+            _git(repo, "fetch", "origin")
+            landed_tree = _git(repo, "rev-parse", f"origin/{protected}^{{tree}}").stdout.strip()
             _git(repo, "reset", "--hard", f"origin/{protected}")
+            note = (
+                ""
+                if landed_tree == validated_tree
+                else "partial batch - combined tree not fully realized; verify"
+            )
+            results = [TrainResult(b, "landed", note) for b in landed_branches]
             results.append(failure)
             results.extend(
                 TrainResult(b, "rejected", f"batch landing halted: {branch} failed - re-queue")
                 for b in built[idx + 1 :]
             )
             return results
-        results.append(TrainResult(branch, "landed"))
+        landed_branches.append(branch)
 
     _git(repo, "fetch", "origin")
     landed_tree = _git(repo, "rev-parse", f"origin/{protected}^{{tree}}").stdout.strip()
+    results = [TrainResult(b, "landed") for b in landed_branches]
     if landed_tree != validated_tree:
         results[-1] = TrainResult(
             built[-1], "error", "batch landed but tree mismatch - INVESTIGATE"

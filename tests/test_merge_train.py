@@ -448,6 +448,14 @@ def main():
     if args[:2] == ["pr", "merge"]:
         pr_number = args[2]
         branch = pr_branches[pr_number]
+        fail_branch = os.environ.get("FAKE_GH_FAIL_BRANCH", "")
+        if branch and branch == fail_branch:
+            # Simulates a per-PR blocker (e.g. a required check unmet on
+            # JUST this branch's PR) - a partial-batch failure, not a
+            # whole-stub failure, so other branches in the same run still
+            # land normally through the un-touched path below.
+            sys.stderr.write(os.environ.get("FAKE_GH_FAIL_MESSAGE", "merge blocked") + "\\n")
+            return 1
         origin_url = subprocess.run(
             ["git", "remote", "get-url", "origin"],
             capture_output=True,
@@ -488,6 +496,9 @@ def write_fake_gh_multi(tmp_path: Path) -> Path:
     (FAKE_GH_BRANCH_PRS, a JSON object) so it can resolve which branch a
     given `pr list --head <branch>` or `pr merge <number>` call is actually
     about, the same way the real `gh` would via GitHub's own PR database.
+    Optionally, FAKE_GH_FAIL_BRANCH names one branch whose `pr merge` call
+    fails (writing FAKE_GH_FAIL_MESSAGE to stderr) instead of squashing -
+    simulating a per-PR blocker so a batch partially lands.
     """
     script = tmp_path / "fake_gh_multi.py"
     script.write_text("#!" + sys.executable + "\n" + FAKE_GH_MULTI_BODY)
@@ -933,6 +944,54 @@ def test_batch_prsquash_final_tree_verified(tmp_path, monkeypatch):
         assert "--match-head-commit" in call
         sha_index = call.index("--match-head-commit") + 1
         assert call[sha_index] == branch_head_sha[pr_to_branch[call[2]]]
+
+
+def test_batch_prsquash_partial_failure_refetches_before_reset_and_flags_partial(
+    tmp_path, monkeypatch
+):
+    # First member's squash lands for real through gh; the second's is
+    # blocked (e.g. a required check unmet on ITS PR specifically) - the
+    # already-landed member must be reported "landed" (no rollback: it
+    # really did land server-side) with a clear "partial batch" note rather
+    # than a false clean landed or a misleading "tree mismatch" error, and
+    # the local checkout must end up reset against a FRESHLY fetched
+    # origin/main, not the stale pre-batch ref the station still had before
+    # gh's stub pushed the first squash straight to the bare origin (the
+    # pre-fix bug: resetting to that stale ref left the station's checkout
+    # on the ORIGINAL pre-batch main, missing claude/good's change even
+    # though it had genuinely landed on the real origin).
+    origin, station = make_world(tmp_path)
+    fake_gh = write_fake_gh_multi(tmp_path)
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv("FAKE_GH_BRANCH_PRS", json.dumps({"claude/good": "1", "claude/bad": "2"}))
+    monkeypatch.setenv("FAKE_GH_FAIL_BRANCH", "claude/bad")
+    monkeypatch.setenv("FAKE_GH_FAIL_MESSAGE", "required status checks have not been met")
+
+    results = run_train(
+        repo=station,
+        branches=["claude/good", "claude/bad"],
+        gate=["/usr/bin/true"],
+        land="pr-squash",
+        batch=2,
+    )
+
+    assert [r.status for r in results] == ["landed", "rejected"]
+    assert "partial batch" in results[0].detail
+    assert "tree mismatch" not in results[0].detail
+    assert "required status checks" in results[1].detail
+    assert "tree mismatch" not in results[1].detail
+
+    # claude/good really did land on the real origin; claude/bad never did.
+    assert git(origin, "show", "main:good.txt") == "good change"
+    with pytest.raises(subprocess.CalledProcessError):
+        git(origin, "show", "main:bad.txt")
+
+    # The station's own checkout reflects the FRESHLY fetched post-squash
+    # main - proof the reset happened AFTER a fetch, not against the stale
+    # ref the station had before gh's stub pushed straight to the bare
+    # origin.
+    assert (station / "good.txt").read_text() == "good change\n"
+    assert not (station / "bad.txt").exists()
 
 
 # --- switchyard.toml config threading ---------------------------------------
