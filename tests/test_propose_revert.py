@@ -177,7 +177,7 @@ def test_propose_revert_reason_file_embedded_as_fenced_data(tmp_path):
 
 # --- propose-revert: gh stub -----------------------------------------------------
 
-FAKE_GH_PR_CREATE_BODY = """# Stub `gh` for propose-revert's PR-creation call - see write_fake_gh_pr_create().
+FAKE_GH_PR_CREATE_BODY = """# Stub `gh` for PR-create call - see write_fake_gh_pr_create() below.
 import json
 import os
 import sys

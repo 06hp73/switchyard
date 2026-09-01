@@ -5,4 +5,12 @@ line-length = 100
 # PLW1510: subprocess.run() must state `check=` explicitly rather than rely
 # on its silently-False default - a hygiene pass (2026-09) audited every
 # call site under tools/ and tests/ and made the choice explicit everywhere.
-extend-select = ["PLW1510"]
+#
+# E/F/W/I/UP/B: widened from the E4/E7/E9/F defaults (2026-09). E now covers
+# the full pycodestyle-errors family (not just E4/E7/E9), F is unchanged, and
+# W (pycodestyle warnings), I (isort import order), UP (pyupgrade
+# modernization), and B (flake8-bugbear common-bug patterns) are newly
+# enabled. Only added because `ruff check . --select E,F,W,I,UP,B,PLW1510`
+# was already zero-finding across the repo; do not extend further (e.g. full
+# "PL", "S", "ANN") without auditing for sweeping, non-idiomatic churn first.
+extend-select = ["E", "F", "W", "I", "UP", "B", "PLW1510"]
