@@ -6,6 +6,11 @@ Resolution order for load_config(), first hit wins:
     3. ~/.config/switchyard/config.toml
     4. all dataclass defaults - today's hardcoded behavior, unchanged
 
+load_config(trusted_only=True) skips step 2 entirely: only $SWITCHYARD_CONFIG
+or ~/.config/switchyard/config.toml may apply, never a repo-local file. Use
+this for guard-scoping keys (protected_branch, product_remote_match) that a
+hostile PR must never be able to change about the guard judging it.
+
 Every tool in this repo must work with zero config at all: the defaults
 below are exactly today's hardcoded constants, so an absent switchyard.toml
 is bit-for-bit the pre-config behavior. A broken config (missing
@@ -123,8 +128,22 @@ def _load_from_path(path: Path) -> SwitchyardConfig:
         return SwitchyardConfig()
 
 
-def load_config(start: Path | None = None) -> SwitchyardConfig:
-    """Resolve and load the effective SwitchyardConfig. Never raises."""
+def load_config(start: Path | None = None, *, trusted_only: bool = False) -> SwitchyardConfig:
+    """Resolve and load the effective SwitchyardConfig. Never raises.
+
+    trusted_only=True skips step 2 (repo-local <toplevel>/switchyard.toml)
+    entirely - only $SWITCHYARD_CONFIG and ~/.config/switchyard/config.toml
+    are considered, in that order, before falling back to defaults.
+
+    Use trusted_only for guard-scoping decisions (git_guard.sh's
+    protected_branch / product_remote_match): a repo-local switchyard.toml
+    can arrive in the very same PR/branch a guard is supposed to be judging,
+    so it must never be able to change what the guard protects or how it
+    recognizes the protected repo. Non-guard callers (the train, the radar,
+    `switchyard status`/`stats`) keep trusted_only=False - a project's own
+    trunk name, gate command, etc. are exactly the kind of thing repo-local
+    config SHOULD be able to set for itself.
+    """
     env_path = os.environ.get("SWITCHYARD_CONFIG")
     if env_path:
         path = Path(env_path)
@@ -133,12 +152,13 @@ def load_config(start: Path | None = None) -> SwitchyardConfig:
         _warn(f"$SWITCHYARD_CONFIG={path} does not exist; using defaults")
         return SwitchyardConfig()
 
-    base = start if start is not None else Path.cwd()
-    toplevel = _find_git_toplevel(base)
-    if toplevel is not None:
-        repo_config = toplevel / "switchyard.toml"
-        if repo_config.is_file():
-            return _load_from_path(repo_config)
+    if not trusted_only:
+        base = start if start is not None else Path.cwd()
+        toplevel = _find_git_toplevel(base)
+        if toplevel is not None:
+            repo_config = toplevel / "switchyard.toml"
+            if repo_config.is_file():
+                return _load_from_path(repo_config)
 
     home_config = Path.home() / ".config" / "switchyard" / "config.toml"
     if home_config.is_file():

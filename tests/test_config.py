@@ -160,6 +160,74 @@ def test_retry_flaky_can_be_disabled_via_config(tmp_path, monkeypatch):
     assert cfg.retry_flaky is False
 
 
+# --- trusted_only: guard-scoping keys must ignore repo-local config --------
+#
+# git_guard.sh's main-push ban reads protected_branch/product_remote_match to
+# decide what it is protecting. A repo-local switchyard.toml can ship in the
+# very same PR/branch the guard is supposed to be judging, so those two keys
+# must be resolvable in a mode that never even looks at a repo-local file -
+# only $SWITCHYARD_CONFIG or ~/.config/switchyard/config.toml, both outside a
+# PR author's control.
+
+
+def test_trusted_only_ignores_repo_local_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "switchyard.toml").write_text('[switchyard]\nprotected_branch = "attacker"\n')
+
+    cfg = load_config(repo, trusted_only=True)
+    assert cfg.protected_branch == "main"  # repo-local config is invisible in trusted-only mode
+
+
+def test_trusted_only_still_honors_home_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "switchyard.toml").write_text('[switchyard]\nprotected_branch = "attacker"\n')
+
+    home_cfg_dir = tmp_path / ".config" / "switchyard"
+    home_cfg_dir.mkdir(parents=True)
+    (home_cfg_dir / "config.toml").write_text('[switchyard]\nprotected_branch = "trunk"\n')
+
+    cfg = load_config(repo, trusted_only=True)
+    assert cfg.protected_branch == "trunk"  # user-level config still applies
+
+
+def test_trusted_only_still_honors_env_var(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "switchyard.toml").write_text('[switchyard]\nprotected_branch = "attacker"\n')
+
+    explicit = tmp_path / "explicit.toml"
+    explicit.write_text('[switchyard]\nprotected_branch = "env-wins"\n')
+    monkeypatch.setenv("SWITCHYARD_CONFIG", str(explicit))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    cfg = load_config(repo, trusted_only=True)
+    assert cfg.protected_branch == "env-wins"
+
+
+def test_non_trusted_load_still_honors_repo_local_by_default(tmp_path, monkeypatch):
+    # trusted_only defaults to False - existing (non-guard) callers such as
+    # the train/radar/status keep today's repo-local-config behavior, since
+    # a project's own trunk name is exactly the kind of thing repo-local
+    # config SHOULD be able to set for itself.
+    monkeypatch.delenv("SWITCHYARD_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "switchyard.toml").write_text('[switchyard]\nprotected_branch = "trunk"\n')
+
+    cfg = load_config(repo)
+    assert cfg.protected_branch == "trunk"
+
+
 def test_config_is_frozen():
     cfg = SwitchyardConfig()
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -232,3 +300,41 @@ def test_cli_falls_back_to_its_own_default_when_no_config_present(tmp_path):
     proc = run_cli("wip_cap", "5", env={**os.environ, "HOME": str(tmp_path)})
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "5"
+
+
+def test_cli_trusted_only_flag_ignores_repo_local_config(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\nprotected_branch = "attacker"\n')
+
+    proc = subprocess.run(
+        [sys.executable, str(CLI_SCRIPT), "--trusted-only", "protected_branch", "main"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+        timeout=10,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "main"  # repo-local config ignored, falls to the CLI's default
+
+
+def test_cli_without_trusted_only_flag_honors_repo_local_config(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "switchyard.toml").write_text('[switchyard]\nprotected_branch = "attacker"\n')
+
+    proc = subprocess.run(
+        [sys.executable, str(CLI_SCRIPT), "protected_branch", "main"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+        timeout=10,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "attacker"  # non-trusted path still reads repo-local config

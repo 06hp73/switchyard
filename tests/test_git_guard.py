@@ -126,6 +126,178 @@ def test_main_push_ban_fail_safe_when_origin_undeterminable(tmp_path):
     assert_blocked("git push origin main", "train", cwd=str(tmp_path / "does-not-exist"))
 
 
+def test_repo_local_config_cannot_disarm_main_push_ban(tmp_path):
+    # A switchyard.toml sitting in the repo itself (e.g. shipped by a PR)
+    # must NEVER be able to change product_remote_match/protected_branch -
+    # those two are guard-scoping and trusted-only (sy_cfg_trusted). No
+    # SWITCHYARD_CONFIG and an isolated HOME here: the repo-local file is the
+    # only config source in play, and it must be completely invisible.
+    ev4sim_repo = make_repo_with_origin(
+        tmp_path, "ev4sim-repo-local", "https://github.com/06hp73/EV4SIM.git"
+    )
+    (ev4sim_repo / "switchyard.toml").write_text(
+        '[switchyard]\nproduct_remote_match = "nonsense-does-not-match-anything"\n'
+    )
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    env = {
+        **os.environ,
+        "PATH": _VENV_BIN + os.pathsep + os.environ.get("PATH", ""),
+        "HOME": str(isolated_home),
+    }
+    payload = json.dumps(
+        {"tool_input": {"command": "git push origin main"}, "cwd": str(ev4sim_repo)}
+    )
+    # cwd=ev4sim_repo is load-bearing: _sy_config_present's repo-toplevel
+    # discovery (`git rev-parse --show-toplevel`) resolves against the
+    # GUARD PROCESS's own OS-level cwd, not the hook JSON's "cwd" field
+    # (which only feeds the separate `git -C "$CWD"` origin lookup) - a real
+    # PreToolUse hook always runs with its process cwd inside the repo being
+    # worked on, so this matches actual usage.
+    result = subprocess.run(
+        ["bash", str(GUARD)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        cwd=str(ev4sim_repo),
+        check=False,
+    )
+    assert result.returncode == 2, (
+        f"repo-local switchyard.toml must not disarm the main-push ban: {result.stdout}"
+    )
+    assert "train" in result.stderr
+
+
+def test_repo_local_config_cannot_override_guard_scoping_even_with_home_config_present(tmp_path):
+    # Stronger version of the test above: force sy_cfg_trusted to actually
+    # shell out to the python CLI (by making a trusted home config exist),
+    # and prove a co-existing repo-local switchyard.toml still contributes
+    # NOTHING to either guard-scoping key - not protected_branch, not
+    # product_remote_match - even though the python path is genuinely
+    # exercised this time, not just short-circuited by the bash presence
+    # check.
+    ev4sim_repo = make_repo_with_origin(
+        tmp_path, "ev4sim-both-configs", "https://github.com/06hp73/EV4SIM.git"
+    )
+    (ev4sim_repo / "switchyard.toml").write_text(
+        '[switchyard]\nprotected_branch = "not-main"\n'
+        'product_remote_match = "nonsense-does-not-match-anything"\n'
+    )
+    fake_home = tmp_path / "fake-home-2"
+    (fake_home / ".config" / "switchyard").mkdir(parents=True)
+    # Present but empty - just enough for _sy_config_present_trusted to see a
+    # real file and invoke the python CLI, without itself setting anything.
+    (fake_home / ".config" / "switchyard" / "config.toml").write_text("[switchyard]\n")
+
+    env = {
+        **os.environ,
+        "PATH": _VENV_BIN + os.pathsep + os.environ.get("PATH", ""),
+        "HOME": str(fake_home),
+    }
+    payload = json.dumps(
+        {"tool_input": {"command": "git push origin main"}, "cwd": str(ev4sim_repo)}
+    )
+    result = subprocess.run(
+        ["bash", str(GUARD)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        cwd=str(ev4sim_repo),  # see comment in the test above - load-bearing
+        check=False,
+    )
+    assert result.returncode == 2, (
+        f"repo-local switchyard.toml must stay invisible to guard-scoping keys "
+        f"even when a trusted home config is also present: {result.stdout}"
+    )
+    assert "train" in result.stderr
+
+
+def test_home_config_can_still_change_product_remote_match(tmp_path):
+    # Unlike a repo-local file, ~/.config/switchyard/config.toml IS trusted
+    # (outside a PR author's control) and may still retarget which repo is
+    # protected.
+    fake_home = tmp_path / "fake-home"
+    (fake_home / ".config" / "switchyard").mkdir(parents=True)
+    (fake_home / ".config" / "switchyard" / "config.toml").write_text(
+        '[switchyard]\nproduct_remote_match = "06hp73/OTHER"\n'
+    )
+    ev4sim_repo = make_repo_with_origin(
+        tmp_path, "ev4sim-home-cfg", "https://github.com/06hp73/EV4SIM.git"
+    )
+    env = {
+        **os.environ,
+        "PATH": _VENV_BIN + os.pathsep + os.environ.get("PATH", ""),
+        "HOME": str(fake_home),
+    }
+    payload = json.dumps(
+        {"tool_input": {"command": "git push origin main"}, "cwd": str(ev4sim_repo)}
+    )
+    result = subprocess.run(
+        ["bash", str(GUARD)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        cwd=str(ev4sim_repo),
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"~/.config/switchyard/config.toml should be trusted enough to retarget "
+        f"product_remote_match: {result.stderr}"
+    )
+
+
+def test_home_config_can_still_change_protected_branch(tmp_path):
+    fake_home = tmp_path / "fake-home-3"
+    (fake_home / ".config" / "switchyard").mkdir(parents=True)
+    (fake_home / ".config" / "switchyard" / "config.toml").write_text(
+        '[switchyard]\nprotected_branch = "trunk"\n'
+    )
+    ev4sim_repo = make_repo_with_origin(
+        tmp_path, "ev4sim-trunk", "https://github.com/06hp73/EV4SIM.git"
+    )
+    env = {
+        **os.environ,
+        "PATH": _VENV_BIN + os.pathsep + os.environ.get("PATH", ""),
+        "HOME": str(fake_home),
+    }
+    # "main" is no longer protected once "trunk" is configured as the trunk...
+    allowed = subprocess.run(
+        ["bash", str(GUARD)],
+        input=json.dumps(
+            {"tool_input": {"command": "git push origin main"}, "cwd": str(ev4sim_repo)}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        cwd=str(ev4sim_repo),
+        check=False,
+    )
+    assert allowed.returncode == 0, f"main should no longer be protected: {allowed.stderr}"
+
+    # ...and "trunk" is blocked instead.
+    blocked = subprocess.run(
+        ["bash", str(GUARD)],
+        input=json.dumps(
+            {"tool_input": {"command": "git push origin trunk"}, "cwd": str(ev4sim_repo)}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        cwd=str(ev4sim_repo),
+        check=False,
+    )
+    assert blocked.returncode == 2, "trunk is now the configured protected branch"
+    assert "train" in blocked.stderr
+
+
 def test_allows_feature_branch_push():
     assert_allowed("git push")
     assert_allowed("git push -u origin claude/parallel-fix-collisions-b2d1f3")

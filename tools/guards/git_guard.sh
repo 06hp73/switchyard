@@ -35,13 +35,23 @@ if [ -n "$CWD" ] && ORIGIN_URL=$(git -C "$CWD" remote get-url origin 2>/dev/null
   # identifies "the protected product repo"; empty (the default when
   # unconfigured) keeps this hardcoded fallback so existing behavior is
   # unchanged with no config file present.
-  PRODUCT_MATCH=$(sy_cfg product_remote_match "")
+  #
+  # Guard-scoping keys (product_remote_match, protected_branch) are read
+  # TRUSTED-ONLY via sy_cfg_trusted: a repo-local switchyard.toml is
+  # invisible to it by design (see tools/lib/config_get.sh /
+  # switchyard_config.load_config's trusted_only). A PR that ships its own
+  # repo-local switchyard.toml must never be able to retarget or disarm this
+  # guard against its own push - only $SWITCHYARD_CONFIG or
+  # ~/.config/switchyard/config.toml (both outside a PR author's control)
+  # may override these two values.
+  PRODUCT_MATCH=$(sy_cfg_trusted product_remote_match "")
   [ -z "$PRODUCT_MATCH" ] && PRODUCT_MATCH="06hp73/EV4SIM"
   case "$ORIGIN_URL" in
     *"$PRODUCT_MATCH"*) : ;;  # the product repo - stays enforced
     *) MAIN_PUSH_GUARD_ACTIVE=0 ;;
   esac
 fi
+PROTECTED_BRANCH=$(sy_cfg_trusted protected_branch "main")
 
 block() {
   echo "Blocked by git_guard: $1" >&2
@@ -121,8 +131,8 @@ fi
 # still anchor the match to a whole ref token, so "feature:main-fix" (whose
 # right side is "main-fix", not "main") is correctly left alone.
 if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ] \
-   && printf ' %s ' "$NORM" | grep -qE 'git[[:space:]]+push\b[^;&|]*[[:space:]]([^[:space:]]*:refs/heads/main|[^[:space:]]*:main|refs/heads/main|main)([[:space:]]|[;&|])'; then
-  block "pushing to main is reserved for the merge train. Push your feature branch and mark the PR ready; the train lands it after testing the combined tree."
+   && printf ' %s ' "$NORM" | grep -qE "git[[:space:]]+push\b[^;&|]*[[:space:]]([^[:space:]]*:refs/heads/${PROTECTED_BRANCH}|[^[:space:]]*:${PROTECTED_BRANCH}|refs/heads/${PROTECTED_BRANCH}|${PROTECTED_BRANCH})([[:space:]]|[;&|])"; then
+  block "pushing to $PROTECTED_BRANCH is reserved for the merge train. Push your feature branch and mark the PR ready; the train lands it after testing the combined tree."
 fi
 
 if printf '%s' "$NORM" | grep -qE 'rm -r?f?r?\b.*\.claude/worktrees'; then
