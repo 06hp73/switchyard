@@ -374,6 +374,56 @@ def test_blocks_rm_rf_on_worktrees():
     assert_blocked("rm -rf /Users/x/repo/.claude/worktrees", "worktree remove")
 
 
+def test_blocks_rm_rf_on_configured_worktree_dir(tmp_path):
+    # worktree_dir (used by `switchyard track new`/`done`) can point track
+    # worktrees somewhere other than .claude/worktrees - the rm-rf ban must
+    # follow it there, on top of (not instead of) the .claude/worktrees
+    # default, which stays protected regardless of what worktree_dir names.
+    config = tmp_path / "switchyard.toml"
+    config.write_text('[switchyard]\nworktree_dir = "/opt/tracks"\n')
+    env = {
+        **os.environ,
+        "PATH": _VENV_BIN + os.pathsep + os.environ.get("PATH", ""),
+        "SWITCHYARD_CONFIG": str(config),
+    }
+
+    configured = subprocess.run(
+        ["bash", str(GUARD)],
+        input=json.dumps({"tool_input": {"command": "rm -rf /opt/tracks/foo"}, "cwd": "/tmp"}),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        check=False,
+    )
+    assert configured.returncode == 2, configured.stdout
+    assert "worktree remove" in configured.stderr
+
+    default_still_active = subprocess.run(
+        ["bash", str(GUARD)],
+        input=json.dumps(
+            {"tool_input": {"command": "rm -rf .claude/worktrees/bar"}, "cwd": "/tmp"}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        check=False,
+    )
+    assert default_still_active.returncode == 2, default_still_active.stdout
+
+    unrelated_path_still_allowed = subprocess.run(
+        ["bash", str(GUARD)],
+        input=json.dumps({"tool_input": {"command": "rm -rf build/"}, "cwd": "/tmp"}),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        check=False,
+    )
+    assert unrelated_path_still_allowed.returncode == 0, unrelated_path_still_allowed.stderr
+
+
 def test_allows_ordinary_commands():
     assert_allowed("git status")
     assert_allowed("git commit -m 'feat: x'")

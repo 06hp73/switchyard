@@ -206,8 +206,23 @@ if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ]; then
   done < <(printf '%s' "$NORM" | grep -oE 'git[[:space:]]+push\b[^;&|]*')
 fi
 
-if printf '%s' "$NORM" | grep -qE 'rm -r?f?r?\b.*\.claude/worktrees'; then
-  block "deleting worktree directories with rm orphans git metadata. Use 'git worktree remove <path>' — and only for your own worktree."
+# .claude/worktrees is always checked, regardless of config - it is the
+# convention this repo's own tooling assumes. worktree_dir (switchyard.toml,
+# used by `switchyard track new`/`done`) additionally names wherever THIS
+# project's track worktrees actually live, when that differs; it is
+# advisory, not guard-scoping (see sy_cfg_trusted's docstring) - the worst a
+# hostile repo-local override could do here is fail to add protection for a
+# custom path, never remove the always-on .claude/worktrees protection
+# above. Fixed-string (grep -F), not a regex: a filesystem path is data, not
+# a pattern, and may itself contain regex metacharacters.
+if printf '%s' "$NORM" | grep -qE 'rm -r?f?r?\b'; then
+  if printf '%s' "$NORM" | grep -qF '.claude/worktrees'; then
+    block "deleting worktree directories with rm orphans git metadata. Use 'git worktree remove <path>' — and only for your own worktree."
+  fi
+  WORKTREE_DIR=$(sy_cfg worktree_dir "")
+  if [ -n "$WORKTREE_DIR" ] && printf '%s' "$NORM" | grep -qF "$WORKTREE_DIR"; then
+    block "deleting worktree directories with rm orphans git metadata. Use 'git worktree remove <path>' — and only for your own worktree."
+  fi
 fi
 
 exit 0
