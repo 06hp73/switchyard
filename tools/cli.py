@@ -85,6 +85,10 @@ import merge_train
 from switchyard_config import load_config
 
 DEFAULT_STATS_DAYS = 14
+# B5: an unbounded history.jsonl/flaky_log.jsonl is never slurped whole for
+# rendering - see _read_jsonl's own docstring for why a tail cap is fine
+# here (and cmd_stats's use of this same constant to note when it was hit).
+JSONL_TAIL_CAP = 5000
 
 
 def _positive_days(value: str) -> int:
@@ -115,12 +119,27 @@ def _humanize_age(seconds: float) -> str:
     return f"{int(days)}d"
 
 
-def _read_jsonl(path: Path) -> list[dict] | None:
+def _read_jsonl(path: Path, *, max_lines: int = JSONL_TAIL_CAP) -> list[dict] | None:
     """Read a JSONL file into a list of dicts, skipping unparseable lines.
 
     Returns None if `path` does not exist or cannot be read at all (caller
     renders the "not present"/"could not read" message); an empty list means
     the file exists but has no usable lines.
+
+    Tail-capped at `max_lines` (B5): only the last `max_lines` lines of the
+    file are ever parsed and returned. A JSONL log here is strictly
+    append-only, so the tail is always the newest entries - this backs
+    `switchyard status`'s FLAKY (last 10) and LAST LANDINGS (last 5)
+    sections, both already far under the cap regardless, and `switchyard
+    stats`'s own aggregation, which is a reporting/cosmetic concern, not a
+    correctness-critical exact count over ALL of history ever recorded -
+    cmd_stats itself notes when this cap was actually hit, so a --days
+    window wide enough to exceed it is visibly, not silently, incomplete.
+    This is the simple version, not a true seek-from-the-end read (the
+    whole file's bytes are still read) - a repo with a multi-megabyte
+    history.jsonl is not this tool's normal shape, and a real backward-seek
+    tail read was judged not worth the added complexity for what stays a
+    reporting concern today.
     """
     if not path.is_file():
         return None
@@ -128,6 +147,7 @@ def _read_jsonl(path: Path) -> list[dict] | None:
         raw_lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     except OSError:
         return None
+    raw_lines = raw_lines[-max_lines:]
     entries = []
     for line in raw_lines:
         try:
@@ -341,6 +361,17 @@ def cmd_stats(args: argparse.Namespace) -> int:
     if entries is None:
         print("  no history recorded yet (.train/history.jsonl not present)")
         return 0
+
+    # _read_jsonl tail-caps its read (B5) - getting back exactly the cap's
+    # worth of entries means history.jsonl has AT LEAST that many records,
+    # so a --days window wide enough to reach further back than what was
+    # actually read would silently undercount without this note.
+    if len(entries) >= JSONL_TAIL_CAP:
+        print(
+            f"  note: history.jsonl has at least {JSONL_TAIL_CAP} records; only "
+            f"the most recent {JSONL_TAIL_CAP} are read, so a wide --days window "
+            "may undercount"
+        )
 
     cutoff = time.time() - days * 86400
     entries = [e for e in entries if e.get("ts", 0) >= cutoff]

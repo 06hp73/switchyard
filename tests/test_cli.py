@@ -425,6 +425,66 @@ def test_cmd_stats_clamps_non_positive_days_when_called_directly(tmp_path, capsy
     assert "last 1 day(s)" in capsys.readouterr().out
 
 
+# --- _read_jsonl / stats: unbounded logs are tail-capped, not slurped whole (B5) --
+
+
+def test_read_jsonl_caps_to_the_most_recent_max_lines(tmp_path):
+    # A JSONL log here is strictly append-only, so the tail is always the
+    # newest entries - a small max_lines keeps this test fast instead of
+    # writing JSONL_TAIL_CAP (5000) real lines just to exercise the cap.
+    sys.path.insert(0, str(CLI_SCRIPT.parent))
+    import cli
+
+    path = tmp_path / "log.jsonl"
+    lines = [json.dumps({"n": i}) for i in range(10)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    entries = cli._read_jsonl(path, max_lines=3)
+
+    assert [e["n"] for e in entries] == [7, 8, 9]
+
+
+def test_stats_notes_the_cap_when_history_hits_it(tmp_path, capsys):
+    sys.path.insert(0, str(CLI_SCRIPT.parent))
+    import argparse
+
+    import cli
+
+    repo = tmp_path / "repo"
+    train_dir = repo / ".train"
+    train_dir.mkdir(parents=True)
+    now = time.time()
+    entries = [
+        {"branch": f"claude/{i}", "status": "landed", "ts": now} for i in range(cli.JSONL_TAIL_CAP)
+    ]
+    (train_dir / "history.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8"
+    )
+
+    rc = cli.cmd_stats(argparse.Namespace(repo=repo, days=1))
+
+    assert rc == 0
+    assert f"at least {cli.JSONL_TAIL_CAP} records" in capsys.readouterr().out
+
+
+def test_stats_omits_the_cap_note_when_history_is_small(tmp_path, capsys):
+    sys.path.insert(0, str(CLI_SCRIPT.parent))
+    import argparse
+
+    import cli
+
+    repo = tmp_path / "repo"
+    train_dir = repo / ".train"
+    train_dir.mkdir(parents=True)
+    entry = {"branch": "claude/x", "status": "landed", "ts": time.time()}
+    (train_dir / "history.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+    rc = cli.cmd_stats(argparse.Namespace(repo=repo, days=1))
+
+    assert rc == 0
+    assert "records" not in capsys.readouterr().out
+
+
 # --- switchyard radar / land (thin passthroughs) ------------------------------
 
 
