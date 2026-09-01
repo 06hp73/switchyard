@@ -250,77 +250,143 @@ def _read_pid(pid_file: Path) -> int | None:
 
 
 def _acquire_lock(repo: Path) -> Path:
-    """Take the train's mutex: an O_EXCL-created .train/lock/pid file.
+    """Take the train's mutex: an atomically-published .train/lock/pid file.
 
-    The PID FILE is the actual mutex, not the containing directory. The
-    previous scheme (mkdir the lock dir, THEN write a pid file inside it as
-    a separate step) had a real TOCTOU window between those two steps: a
-    second process could see the directory already exists, find no pid file
-    written yet (or race a stale one), decide the lock was abandoned, and
-    rmtree+recreate it out from under a process that was still
-    mid-acquisition - proven exploitable in review (both trains then push
-    the protected branch, and whichever `finally` runs first deletes the
-    other's lock). `os.open(path, O_CREAT | O_EXCL | O_WRONLY)` creates the
-    file and checks exclusivity in one atomic kernel call, closing that
-    window entirely: only one process can ever win that create for a given
-    path, full stop.
+    The PID FILE is the actual mutex, not the containing directory. Two
+    earlier schemes both had a real race window:
 
-    On losing that race (FileExistsError): read whoever's pid is in there. A
-    live holder is a normal, clean refusal (SystemExit - same message as
-    before). A dead/unreadable holder means the previous run crashed without
-    cleaning up - reclaim by unlinking the stale pid file and retrying the
-    SAME atomic create exactly once. If that retry ALSO loses the race, some
-    other process reclaimed it first in the meantime; rather than loop
-    (which could spin forever under contention), that is simply treated as
-    "held" and refused, same as an ordinary live holder.
+      - mkdir-the-lock-dir-then-separately-write-a-pid-file (the original
+        scheme) let a second process see the directory already exists, find
+        no pid file written yet, decide the lock was abandoned, and
+        rmtree+recreate it out from under a process still mid-acquisition -
+        proven exploitable in review (both trains then push the protected
+        branch).
+      - a single os.open(path, O_CREAT | O_EXCL | O_WRONLY) directly on the
+        pid file (the first C2 fix) closed that hole but opened a narrower
+        one: create and write were still two SEPARATE syscalls, so between
+        them the pid file existed but was EMPTY. A second acquirer whose own
+        O_EXCL create lost that race would read the empty file, get None
+        back from _read_pid, and the old code treated None exactly like "a
+        dead holder" - unlinking the winner's in-progress file and
+        reclaiming the lock while the winner was still actively publishing
+        it. A verification audit reproduced up to 4 concurrent "winners"
+        this way.
+
+    The fix: never let the pid file exist in an incomplete state at all.
+    The pid is written out fully to a per-process temp file first, and only
+    then published under the shared name via a single os.link() call -
+    POSIX's classic atomic test-and-set. There is no create-then-write
+    window to lose a race in, because all the writing happens on a name
+    nothing else can see; the link is the ONE indivisible step that makes
+    it visible, complete, under the shared name:
+
+      1. Write the pid, complete, to .train/lock/pid.<our pid>.tmp
+         (flushed and fsynced before the link).
+      2. os.link(tmp, pid_file). Success: we hold the lock. FileExistsError:
+         someone else already holds it - always a fully-formed file, never
+         a partial one, because this is the only way this code ever creates
+         it.
+
+    On losing that link: read whoever's pid is in there - that read is now
+    trustworthy, since an existing pid file was necessarily published
+    complete.
+      - A live holder is a normal, clean refusal (SystemExit).
+      - A pid file that EXISTS but does not parse (empty or garbage) can
+        never happen from this code's own publication path anymore - it is
+        external tampering, not an in-flight competitor, and is refused,
+        NEVER treated as "dead". This is the specific fix for the hole
+        above: an empty pid file now means refuse, not reclaim.
+      - A pid file that has vanished entirely (the holder released for real
+        between our failed link and this check) is genuinely free - nothing
+        to unlink, fall straight through to the retry below.
+      - A dead holder's pid file is unlinked and the SAME atomic link is
+        retried exactly once. If that retry also loses (another reclaimer
+        won first), that is simply treated as "held" and refused rather
+        than looping, which could spin forever under contention.
+
+    The per-process temp file is always removed - a try/finally around the
+    whole body covers every exit path (success, refusal, or an unexpected
+    exception) - so a leaked pid.<pid>.tmp never accumulates. It is created
+    O_TRUNC rather than O_EXCL: the name already carries our own pid, so the
+    only process that could ever collide with it is a long-dead one whose
+    same pid got reused by the OS and which itself already failed to clean
+    up - truncating and overwriting that leftover is strictly safer than
+    erroring out on it.
 
     The directory itself (repo/.train/lock) is still created first (mkdir
     with exist_ok=True) purely as the pid file's container - it carries no
-    locking semantics of its own anymore, so two processes racing on that
-    mkdir is harmless (exist_ok=True lets both succeed).
+    locking semantics of its own, so two processes racing on that mkdir is
+    harmless (exist_ok=True lets both succeed).
     """
     lock = _state_dir(repo) / "lock"
     lock.mkdir(exist_ok=True)
     pid_file = lock / "pid"
+    tmp = lock / f"pid.{os.getpid()}.tmp"
 
-    def try_create() -> bool:
+    def publish() -> bool:
         try:
-            fd = os.open(pid_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.link(tmp, pid_file)
         except FileExistsError:
             return False
-        try:
-            os.write(fd, str(os.getpid()).encode())
-        finally:
-            os.close(fd)
         return True
 
-    if try_create():
-        return lock
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
-    holder = _read_pid(pid_file)
-    if holder is not None and _pid_alive(holder):
+        if publish():
+            return lock
+
+        holder = _read_pid(pid_file)
+        if holder is not None:
+            if _pid_alive(holder):
+                raise SystemExit(
+                    f"another train run holds .train/lock (held by pid {holder}; "
+                    "remove .train/lock if certain no train runs)"
+                ) from None
+            print(f"reclaimed stale train lock (pid {holder} dead)")
+            try:
+                os.unlink(pid_file)
+            except FileNotFoundError:
+                pass  # already gone - the retry below decides who actually wins it
+        elif pid_file.exists():
+            # Exists but did not parse (empty or garbage). Under this
+            # link-publish scheme that can only be external tampering, not
+            # an in-flight competitor - a real pid file is always complete
+            # from the instant it exists. Refuse rather than guess it is
+            # dead: this is the exact hole the old two-step
+            # create-then-write scheme had.
+            raise SystemExit(
+                "another train run holds .train/lock (pid file exists but is "
+                "empty or unreadable - refusing to treat that as a dead "
+                "holder; remove .train/lock if certain no train runs)"
+            ) from None
+        # else: pid_file no longer exists at all - released for real between
+        # our failed link and this check. Nothing to unlink; fall through to
+        # the retry below, same as after a genuine dead-holder reclaim.
+
+        if publish():
+            return lock
+
+        # Lost the reclaim race too: another process's link won between
+        # whatever freed the name (our unlink, or someone else releasing)
+        # and our retry. Whatever it published is the live lock now -
+        # refuse rather than loop, exactly like an ordinary live-holder
+        # refusal.
+        holder = _read_pid(pid_file)
         raise SystemExit(
             f"another train run holds .train/lock (held by pid {holder}; "
             "remove .train/lock if certain no train runs)"
         ) from None
-
-    print(f"reclaimed stale train lock (pid {holder} dead)")
-    try:
-        os.unlink(pid_file)
-    except FileNotFoundError:
-        pass  # already gone - the retry below decides who actually wins it
-
-    if try_create():
-        return lock
-
-    # Lost the reclaim race too: another process's create won between our
-    # unlink and our retry. Whatever it wrote is the live lock now - refuse
-    # rather than loop, exactly like an ordinary live-holder refusal.
-    holder = _read_pid(pid_file)
-    raise SystemExit(
-        f"another train run holds .train/lock (held by pid {holder}; "
-        "remove .train/lock if certain no train runs)"
-    ) from None
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def _release_lock(lock: Path) -> None:
