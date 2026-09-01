@@ -80,6 +80,9 @@ bin/switchyard radar  --repo <station>   # passthrough - identical to collision_
 bin/switchyard land   --repo <station>   # passthrough - identical to `merge_train.py run`'s own flags
 bin/switchyard track new <name>          # branch + worktree from `worktree_dir`/`branch_prefix` + draft PR
 bin/switchyard track done <name>         # verify the PR merged (or --force-local), then remove worktree + branches
+bin/switchyard watch install             # opt-in launchd agent: periodic `land` (macOS, off by default)
+bin/switchyard watch uninstall           # unload + remove that agent
+bin/switchyard watch status              # is it installed, is it loaded
 ```
 
 `status` and `stats` are read-only and safe to run anytime, including
@@ -99,6 +102,17 @@ repo's own convention is squash-merge onto the protected branch, so a
 landed track branch's commits never become reachable from its ancestry —
 `git branch -d`'s "is this merged" check would refuse every track branch by
 design, even ones that landed cleanly.
+
+`watch install` writes and loads a per-repo `~/Library/LaunchAgents/
+com.switchyard.<reponame>.plist` that runs `bin/switchyard land --repo
+<station> --land pr-squash --batch <cfg.batch>` every `--interval` seconds
+(default 1200 = 20 minutes) — pr-squash, not push, because an unattended
+watcher must land through the same server-side ruleset a human-reviewed PR
+would. It refuses with a clear message if `station` is unset in
+`switchyard.toml`, and every `watch` subcommand takes `--dry-run` to print
+what it would do (the plist XML for `install`, the unload/remove actions
+for `uninstall`) without touching `launchctl` or the filesystem. Nothing
+installs this automatically; it is opt-in only.
 
 ## Configuration
 

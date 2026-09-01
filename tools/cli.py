@@ -32,6 +32,18 @@ Subcommands:
     switchyard track new <name> [--repo PATH]
     switchyard track done <name> [--repo PATH] [--force-local] [--dry-run]
         Track lifecycle - see cmd_track_new/cmd_track_done below.
+
+    switchyard watch install [--repo PATH] [--interval SECONDS] [--dry-run]
+    switchyard watch uninstall [--repo PATH] [--dry-run]
+    switchyard watch status [--repo PATH]
+        Opt-in launchd agent (macOS only) that runs `bin/switchyard land
+        --repo <station> --land pr-squash --batch <cfg.batch>` every
+        `--interval` seconds (default 1200). NOT enabled anywhere by
+        default - `install` refuses with a clear message if
+        switchyard.toml's `station` is unset, and every subcommand takes
+        `--dry-run` to print what it would do (the plist XML for `install`,
+        the unload+remove actions for `uninstall`) without touching
+        launchctl or the filesystem. See cmd_watch_install below.
 """
 
 from __future__ import annotations
@@ -538,6 +550,152 @@ def cmd_track_done(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- switchyard watch install / uninstall / status: opt-in launchd watcher ----
+#
+# NOT enabled anywhere by default - install must be run explicitly, and even
+# then only writes/loads a per-repo launchd agent under the current user's
+# own ~/Library/LaunchAgents, never anything system-wide or root-owned.
+
+
+def _watch_label(reponame: str) -> str:
+    return f"com.switchyard.{reponame}"
+
+
+def _watch_plist_path(reponame: str) -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{_watch_label(reponame)}.plist"
+
+
+def _watch_plist_dict(
+    reponame: str,
+    switchyard_bin: Path,
+    station: Path,
+    batch: int,
+    interval: int,
+    log_path: Path,
+) -> dict:
+    """The launchd job description for periodic `switchyard land`.
+
+    pr-squash, not push: a launchd-driven watcher runs unattended, so it
+    must land through the same server-side ruleset/required-checks path a
+    human-reviewed PR would - never a bare push straight to the protected
+    branch. `batch` mirrors whatever the station's own switchyard.toml
+    configures, so the watcher's batching matches manual `land` runs.
+    """
+    return {
+        "Label": _watch_label(reponame),
+        "ProgramArguments": [
+            str(switchyard_bin),
+            "land",
+            "--repo",
+            str(station),
+            "--land",
+            "pr-squash",
+            "--batch",
+            str(batch),
+        ],
+        "StartInterval": interval,
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+        "RunAtLoad": False,
+    }
+
+
+def _watch_plist_xml(data: dict) -> str:
+    import plistlib
+
+    return plistlib.dumps(data, fmt=plistlib.FMT_XML).decode("utf-8")
+
+
+def cmd_watch_install(args: argparse.Namespace) -> int:
+    repo = args.repo.resolve()
+    cfg = load_config(repo)
+    if not cfg.station:
+        print(
+            "switchyard watch install: station is not set in switchyard.toml - "
+            "set [switchyard].station to the train's station clone path first"
+        )
+        return 2
+
+    reponame = repo.name
+    station = Path(cfg.station).expanduser()
+    # bin/switchyard next to THIS toolkit checkout, not the target repo -
+    # launchd jobs get no shell PATH/cwd, so this must be an absolute path.
+    switchyard_bin = Path(__file__).resolve().parent.parent / "bin" / "switchyard"
+    plist_path = _watch_plist_path(reponame)
+    log_path = station / ".train" / "watch.log"
+    data = _watch_plist_dict(reponame, switchyard_bin, station, cfg.batch, args.interval, log_path)
+    xml = _watch_plist_xml(data)
+
+    if args.dry_run:
+        print(f"[dry-run] would write {plist_path}:")
+        print(xml)
+        print(f"[dry-run] would run: launchctl load -w {plist_path}")
+        return 0
+
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(xml, encoding="utf-8")
+    print(f"wrote {plist_path}")
+
+    load = subprocess.run(
+        ["launchctl", "load", "-w", str(plist_path)], capture_output=True, text=True
+    )
+    if load.returncode == 0:
+        print(f"loaded via launchctl - runs `switchyard land` every {args.interval}s")
+    else:
+        print(f"launchctl load failed (plist is written anyway): {load.stderr.strip()}")
+        print(f"load it by hand with: launchctl load -w {plist_path}")
+
+    print(f"verify with: launchctl list | grep {_watch_label(reponame)}")
+    print(f"logs at: {log_path}")
+    print(f"uninstall with: switchyard watch uninstall --repo {repo}")
+    return 0
+
+
+def cmd_watch_uninstall(args: argparse.Namespace) -> int:
+    repo = args.repo.resolve()
+    reponame = repo.name
+    plist_path = _watch_plist_path(reponame)
+
+    if args.dry_run:
+        print(f"[dry-run] would run: launchctl unload -w {plist_path}")
+        print(f"[dry-run] would remove: {plist_path}")
+        return 0
+
+    unload = subprocess.run(
+        ["launchctl", "unload", "-w", str(plist_path)], capture_output=True, text=True
+    )
+    if unload.returncode != 0:
+        print(f"launchctl unload skipped/failed (tolerated): {unload.stderr.strip()}")
+
+    if plist_path.exists():
+        plist_path.unlink()
+        print(f"removed {plist_path}")
+    else:
+        print(f"{plist_path} was not present - nothing to remove")
+    return 0
+
+
+def cmd_watch_status(args: argparse.Namespace) -> int:
+    repo = args.repo.resolve()
+    reponame = repo.name
+    plist_path = _watch_plist_path(reponame)
+
+    if not plist_path.exists():
+        print(f"not installed ({plist_path} does not exist)")
+        return 0
+
+    print(f"plist present: {plist_path}")
+    proc = subprocess.run(
+        ["launchctl", "list", _watch_label(reponame)], capture_output=True, text=True
+    )
+    if proc.returncode == 0:
+        print("loaded in launchctl:")
+        print(proc.stdout.strip())
+    else:
+        print("plist file exists but is not currently loaded in launchctl")
+    return 0
+
+
 # --- argument parsing ----------------------------------------------------------
 
 
@@ -586,6 +744,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="print what would happen, change nothing"
     )
     p_track_done.set_defaults(func=cmd_track_done)
+
+    p_watch = sub.add_parser(
+        "watch", help="opt-in launchd periodic `switchyard land` (macOS only, off by default)"
+    )
+    watch_sub = p_watch.add_subparsers(dest="watch_cmd", required=True)
+
+    p_watch_install = watch_sub.add_parser(
+        "install", help="write + load a launchd agent that runs `switchyard land` periodically"
+    )
+    p_watch_install.add_argument("--repo", type=Path, default=Path.cwd())
+    p_watch_install.add_argument(
+        "--interval",
+        type=int,
+        default=1200,
+        help="seconds between runs (launchd StartInterval, default 1200 = 20 minutes)",
+    )
+    p_watch_install.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the plist that would be written instead of writing/loading it",
+    )
+    p_watch_install.set_defaults(func=cmd_watch_install)
+
+    p_watch_uninstall = watch_sub.add_parser("uninstall", help="unload + remove the launchd agent")
+    p_watch_uninstall.add_argument("--repo", type=Path, default=Path.cwd())
+    p_watch_uninstall.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be unloaded/removed instead of doing it",
+    )
+    p_watch_uninstall.set_defaults(func=cmd_watch_uninstall)
+
+    p_watch_status = watch_sub.add_parser(
+        "status", help="report whether the launchd agent is installed and loaded"
+    )
+    p_watch_status.add_argument("--repo", type=Path, default=Path.cwd())
+    p_watch_status.set_defaults(func=cmd_watch_status)
 
     return parser
 
