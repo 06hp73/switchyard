@@ -509,6 +509,35 @@ def cmd_track_new(args: argparse.Namespace) -> int:
         print(f"switchyard track new: could not create branch/worktree: {add.stderr.strip()}")
         return 2
 
+    # GitHub refuses createPullRequest with "No commits between <base> and
+    # <head>" when a branch carries none of its own - which is exactly the
+    # state `git worktree add -b` leaves a fresh track in, so the draft-PR
+    # step below could never once succeed. One empty commit gives the PR
+    # something to exist against and costs nothing afterwards: its tree is
+    # identical to the protected branch's, so wip_status.sh's tip-vs-tip
+    # diff keeps the track out of the live count until real work lands, and
+    # the train's squash merge drops it entirely.
+    seed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(worktree_path),
+            "commit",
+            "--allow-empty",
+            "-m",
+            f"chore: open track {name}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if seed.returncode != 0:
+        print(
+            f"switchyard track new: could not seed the track commit "
+            f"({seed.stderr.strip()}) - the draft PR cannot open until this "
+            f"branch has a commit of its own"
+        )
+
     push = subprocess.run(
         ["git", "-C", str(repo), "push", "-u", "origin", branch],
         capture_output=True,
@@ -546,16 +575,22 @@ def cmd_track_new(args: argparse.Namespace) -> int:
             gh_create, capture_output=True, text=True, cwd=repo, timeout=60, check=False
         )
         gh_ok = pr.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
+        gh_reason = pr.stderr.strip() or pr.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
         gh_ok = False
+        gh_reason = str(exc)
 
     print(f"worktree ready: {worktree_path}")
     print(f"branch: {branch}")
     if gh_ok:
         print("draft PR opened.")
     else:
-        print("gh unavailable or PR creation failed - branch and worktree are ready anyway.")
-        print("open the draft PR later with:")
+        # gh's own words, not a guess: the blanket "gh unavailable" printed
+        # here before hid real, fixable causes (a branch with no commits of
+        # its own, a base branch missing on the remote) behind a wrong
+        # explanation about PATH.
+        print(f"draft PR not opened: {gh_reason or 'gh unavailable'}")
+        print("branch and worktree are ready anyway. Open the draft PR later with:")
         print(f"  {shlex.join(gh_create)}")
     print(f"next: cd {worktree_path} && start working")
     return 0

@@ -6,6 +6,7 @@ still create the branch + worktree and push it, and `track done` needs
 `--force-local` to skip the "PR is MERGED" check gh would otherwise perform.
 """
 
+import shlex
 import subprocess
 import sys
 import time
@@ -67,15 +68,62 @@ def write_config(repo: Path, worktree_root: Path, branch_prefix: str = "claude/"
     )
 
 
-def run_cli(*args: str, home: Path, timeout: int = 30) -> subprocess.CompletedProcess:
+def run_cli(
+    *args: str, home: Path, timeout: int = 30, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(CLI_SCRIPT), *args],
         capture_output=True,
         text=True,
-        env={**ENV, "HOME": str(home)},
+        env={**ENV, "HOME": str(home), **(extra_env or {})},
         timeout=timeout,
         check=False,
     )
+
+
+def write_stub_gh(tmp_path: Path, exit_code: int, stderr: str = "", stdout: str = "") -> Path:
+    """A fake `gh` for SWITCHYARD_GH, so the draft-PR half of `track new` is
+    exercised at all. Every other test in this file runs with no gh on PATH
+    and therefore only ever reaches the printed-fallback path - which is how
+    a PR-creation bug (GitHub refusing a head branch with no commits of its
+    own) survived unnoticed: nothing here ever called gh."""
+    stub = tmp_path / "stub-gh"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' {shlex.quote(stdout)}\n"
+        f"printf '%s' {shlex.quote(stderr)} >&2\n"
+        f"exit {exit_code}\n"
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def write_github_like_gh(tmp_path: Path) -> Path:
+    """A `gh pr create` stub that enforces the one GitHub rule this command
+    kept tripping over: createPullRequest refuses a head branch carrying no
+    commits the base does not already have. A stub that always succeeds
+    would pass against the very bug these tests exist to catch."""
+    stub = tmp_path / "github-like-gh"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'head=""; base=""\n'
+        "while [ $# -gt 0 ]; do\n"
+        '  case "$1" in\n'
+        '    --head) head="$2"; shift 2;;\n'
+        '    --base) base="$2"; shift 2;;\n'
+        "    *) shift;;\n"
+        "  esac\n"
+        "done\n"
+        'n=$(git rev-list --count "$base".."$head" 2>/dev/null || echo 0)\n'
+        'if [ "${n:-0}" -eq 0 ]; then\n'
+        '  echo "pull request create failed: GraphQL: No commits between '
+        '$base and $head (createPullRequest)" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        "echo https://example.invalid/pr/1\n"
+    )
+    stub.chmod(0o755)
+    return stub
 
 
 # --- switchyard track new ------------------------------------------------------
@@ -104,6 +152,76 @@ def test_track_new_creates_branch_and_worktree_with_gh_fallback(tmp_path):
     assert git(origin, "rev-parse", branch) == git(repo, "rev-parse", branch)
     # the worktree path is surfaced to the user
     assert str(wt_path) in proc.stdout
+
+
+def test_track_new_seeds_a_commit_so_a_draft_pr_can_open(tmp_path):
+    # GitHub refuses createPullRequest with "No commits between <base> and
+    # <head>", so a track branch that is level with the protected branch can
+    # never have a PR opened for it. track new must therefore return with the
+    # branch already one commit ahead...
+    origin, repo = make_world(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    write_config(repo, worktree_root)
+
+    proc = run_cli("track", "new", "seeded", "--repo", str(repo), home=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    branch = "claude/seeded"
+    assert int(git(repo, "rev-list", "--count", f"main..{branch}")) == 1
+    # ...and level in CONTENT, so wip_status.sh's tip-vs-tip diff keeps a
+    # freshly-opened track out of the live WIP count until real work lands.
+    assert git_ok(repo, "diff", "--quiet", "main", branch)
+    # The seed commit is pushed too - GitHub judges the remote head, not the
+    # local one.
+    assert git(origin, "rev-parse", branch) == git(repo, "rev-parse", branch)
+
+
+def test_track_new_opens_the_draft_pr_when_gh_succeeds(tmp_path):
+    _origin, repo = make_world(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    write_config(repo, worktree_root)
+    stub = write_github_like_gh(tmp_path)
+
+    proc = run_cli(
+        "track",
+        "new",
+        "with-pr",
+        "--repo",
+        str(repo),
+        home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(stub)},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "draft PR opened." in proc.stdout
+
+
+def test_track_new_reports_ghs_own_reason_when_pr_creation_fails(tmp_path):
+    # The old blanket "gh unavailable or PR creation failed" hid the real
+    # cause behind a wrong guess about PATH; gh's stderr must reach the user.
+    _origin, repo = make_world(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    write_config(repo, worktree_root)
+    stub = write_stub_gh(
+        tmp_path,
+        exit_code=1,
+        stderr="pull request create failed: GraphQL: No commits between main and claude/x\n",
+    )
+
+    proc = run_cli(
+        "track",
+        "new",
+        "no-pr",
+        "--repo",
+        str(repo),
+        home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(stub)},
+    )
+
+    # Still a success overall: branch and worktree are real either way.
+    assert proc.returncode == 0, proc.stderr
+    assert "No commits between main and claude/x" in proc.stdout
+    assert (worktree_root / "no-pr").is_dir()
 
 
 def test_track_new_errors_clearly_when_worktree_dir_unset(tmp_path):
