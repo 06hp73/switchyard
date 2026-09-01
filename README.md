@@ -124,9 +124,16 @@ anyone but the train.
 ## The `switchyard` CLI
 
 `bin/switchyard` is a single entry point over the scripts above (add it to
-`PATH`, or call it by path). `SWITCHYARD_PYTHON` picks the interpreter
-(default `python3` — must resolve to 3.11+ for `switchyard.toml` support;
-every command still degrades gracefully, never crashes, on an older one).
+`PATH`, or call it by path). It resolves its own interpreter via
+`tools/lib/resolve_python.sh` (the same resolver the bash guards use for
+their own config reads): `$SWITCHYARD_PYTHON` if set and verified ≥ 3.11,
+else the first of `python3.13`/`python3.12`/`python3.11` found on `PATH`,
+else bare `python3` only if it verifies as ≥ 3.11 too. If none of those
+resolve, `bin/switchyard` exits 1 with a clear stderr message pointing at
+`SWITCHYARD_PYTHON`, rather than silently running under whatever older
+`python3` it found — unlike the bash guards' own config reads, which warn on
+stderr and fall back to their hardcoded default value instead of crashing,
+since a guard must never take a session down.
 
 ```bash
 bin/switchyard status --repo <station>   # one composed view: WIP, radar, queue, flaky, last landings
@@ -146,6 +153,14 @@ against a repo that has never trained: each section (WIP/RADAR/QUEUE/FLAKY/
 LAST LANDINGS) reports its own "nothing here yet" line instead of failing
 the whole view when its data source (`gh`, `.train/history.jsonl`, ...) is
 absent.
+
+Both resolve `--repo` the same way: an explicit `--repo` always wins,
+otherwise they prefer the configured `[switchyard].station` over the bare
+working directory, since train state almost always lives in the station
+clone, not wherever a human happens to be sitting when they type the
+command. Both always print the resolved `repo:` path and whether `.train/`
+exists there as their first lines, so an empty view is never mistaken for
+"nothing has happened" instead of "looked in the wrong directory."
 
 `track new`/`track done` need `worktree_dir` set in `switchyard.toml`
 (`track new` errors with a clear message otherwise); `branch_prefix`
@@ -213,7 +228,7 @@ of crashing — a broken config must never brick a guard. See
 
 ## Tests
 
-218 tests, plain pytest, no project dependencies (needs Python 3.11+ for
+243 tests, plain pytest, no project dependencies (needs Python 3.11+ for
 `tomllib` — see `tools/lib/switchyard_config.py`):
 
 ```bash
