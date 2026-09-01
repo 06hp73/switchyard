@@ -568,3 +568,134 @@ def test_main_push_ban_uses_configured_product_remote_match(tmp_path):
     )
     assert blocked.returncode == 2, "OTHER is now the configured protected repo"
     assert "train" in blocked.stderr
+
+
+# --- hardening: realistic accident-cases (not adversarial completeness -----
+# see README.md's "Enforcement model" section: the pre-push hook
+# (tools/guards/pre_push_hook.sh) is the real backstop for a determined
+# bypass; these tests only cover the cheap, plausible ones a cooperative
+# agent could type by accident.
+
+
+def test_blocks_backslash_escaped_main_refspec():
+    # A single backslash before an ordinary character is a shell no-op - the
+    # backslash is removed and the character is kept - so "\main" and
+    # "ma\in" are both byte-for-byte "main" by the time git ever sees the
+    # argument. The old stripping only removed quote characters, never
+    # backslashes, so either form slipped through unrecognized.
+    assert_blocked("git push origin \\main", "train")
+    assert_blocked("git push origin ma\\in", "train")
+
+
+def test_backslash_stripping_does_not_over_match_a_safe_branch():
+    assert_allowed("git push origin \\claude-x")
+    assert_allowed("git push origin cla\\ude-x")
+
+
+def test_blocks_quoted_push_subcommand():
+    # A real shell drops the quote characters before git ever sees the
+    # subcommand word too, not just the refspec - 'git "push"' and
+    # 'git pu"sh"' both run an ordinary push. The old code compared the
+    # still-quoted literal token directly against "push", which never
+    # matched, so the whole invocation fell through unclassified (and so
+    # silently allowed) regardless of its destination.
+    assert_blocked('git "push" origin main', "train")
+    assert_blocked('git pu"sh" origin main', "train")
+
+
+def test_quoted_push_subcommand_to_feature_branch_still_allowed():
+    assert_allowed('git "push" origin claude/x')
+
+
+def test_blocks_unrecognized_global_option_before_push():
+    # Only -C/-c/--git-dir/--work-tree used to be recognized as "a global
+    # option in front of push" - any OTHER leading flag (--no-pager, -P, a
+    # future unknown one) stopped the walk cold, leaving the whole
+    # invocation unclassified as anything at all (neither push nor
+    # not-push) and so silently allowed no matter what it targeted.
+    assert_blocked("git --no-pager push origin main", "train")
+    assert_blocked("git -P push origin main", "train")
+    assert_blocked("git --no-replace-objects push origin main", "train")
+    assert_blocked("git --no-pager -P push origin main", "train")
+
+
+def test_unrecognized_global_option_to_feature_branch_still_allowed():
+    # The generic skip must not overreach into blocking safe pushes just
+    # because some unrecognized flag happened to precede them.
+    assert_allowed("git --no-pager push origin claude/x")
+    assert_allowed("git -P push origin claude/x")
+
+
+def test_blocks_heads_prefixed_main_refspec():
+    # git resolves a partial ref path missing the leading "refs/" the same
+    # as the full form - "heads/main" means exactly refs/heads/main - but
+    # the old code only ever recognized the bare name or the full
+    # "refs/heads/<branch>" form, never this shorter one in between.
+    assert_blocked("git push origin heads/main", "train")
+    assert_blocked("git push origin src:heads/main", "train")
+
+
+def test_heads_prefixed_feature_branch_still_allowed():
+    assert_allowed("git push origin heads/claude-x")
+
+
+def test_heads_normalization_does_not_break_full_refs_heads_form():
+    # Regression guard for the heads/-stripping fix itself: "refs/heads/
+    # main" must keep matching via the pre-existing full-form check, not be
+    # broken by a stray partial strip (it starts with "refs/", never
+    # "heads/", so the new case arm must never fire on it at all).
+    assert_blocked("git push origin refs/heads/main", "train")
+    assert_allowed("git push origin refs/heads/claude-x")
+
+
+def test_blocks_git_dir_env_assignment_push_to_main():
+    # GIT_DIR=/GIT_WORK_TREE= as an ENVIRONMENT ASSIGNMENT before the word
+    # "git" redirects which repo a plain invocation acts on exactly like
+    # -C/--git-dir do as flags - but it sits before "git" in the text, so
+    # naively extracting from the first "git\b" match can even land INSIDE
+    # a path like "/x/repo.git" (which itself contains the substring "git")
+    # instead of the real command word, corrupting the whole tokenization.
+    # A real git-dir path conventionally ends in exactly that shape.
+    assert_blocked("GIT_DIR=/other/repo/.git git push origin main", "train")
+    assert_blocked("GIT_DIR=/x/repo.git git push origin main", "train")
+    assert_blocked("GIT_WORK_TREE=/somewhere git push origin main", "train")
+
+
+def test_git_dir_env_assignment_path_containing_git_substring_still_extracts_correctly():
+    # Stronger version of the above: the path itself contains "git" as a
+    # substring in a way that does NOT end the path (mid-word, not a ".git"
+    # suffix) - the extraction's tightened left boundary (a "git" token must
+    # be preceded by whitespace/separator/start, not just any word
+    # boundary) must still find the REAL "git" command word, not this one.
+    assert_blocked("GIT_WORK_TREE=/home/user/git-worktrees/x git push origin main", "train")
+
+
+def test_git_dir_env_assignment_push_to_feature_branch_still_allowed():
+    # An explicit, non-protected-named destination is unambiguous regardless
+    # of which repo GIT_DIR actually redirects to - same reasoning already
+    # applied to -C/--git-dir as flags.
+    assert_allowed("GIT_DIR=/other/repo/.git git push origin claude/x")
+
+
+def test_git_dir_env_assignment_refspecless_push_fails_safe(tmp_path):
+    # GIT_DIR may point at a wholly different repo; $CURRENT_BRANCH speaks
+    # only for the hook's own cwd and cannot answer for that other repo, so
+    # an IMPLICIT destination (no explicit refspec) under GIT_DIR must
+    # refuse outright - even run from a cwd whose own current branch is an
+    # entirely harmless feature branch, mirroring the existing -C fail-safe
+    # test for the flag form of this same redirection.
+    on_feature = make_repo_on_branch(tmp_path, "gitdir-refspecless", "claude/w")
+    assert_blocked("GIT_DIR=/some/other/repo git push origin", "train", cwd=str(on_feature))
+    assert_blocked("GIT_DIR=/some/other/repo git push", "train", cwd=str(on_feature))
+
+
+def test_compound_command_without_spaces_around_operator_still_classified():
+    # The tightened extraction's left boundary can itself glue a bare
+    # "&"/";" onto the front of the match when there is no space around the
+    # operator (e.g. "cd /x&&git push..." segments as "&git push...") -
+    # this must not corrupt classification (TOKENS[0] is never inspected,
+    # only tokens from index 1 onward are, so this is harmless) nor open a
+    # gap for a real accident of this shape.
+    assert_blocked("cd /x&&git push origin main", "train")
+    assert_blocked("ls;git push origin main", "train")
+    assert_allowed("cd /x&&git push origin claude/x")
