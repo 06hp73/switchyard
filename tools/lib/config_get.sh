@@ -16,6 +16,11 @@
 # helper is invoked ONLY when one of those actually exists. When none do,
 # sy_cfg/sy_cfg_trusted are a pure bash string-echo with zero extra process
 # cost, so every guard stays as fast as it was before this file existed.
+#
+# The python interpreter used to run that helper is
+# "${SWITCHYARD_PYTHON:-python3}" - SWITCHYARD_PYTHON overrides a bare
+# python3 wherever the ambient one predates tomllib (Python 3.11+; see
+# switchyard_config.py) or isn't on PATH at all.
 SY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _sy_config_present() {
@@ -40,8 +45,8 @@ _sy_config_present_trusted() {
 sy_cfg() {
   local key="$1" default="$2"
   if _sy_config_present; then
-    python3 "$SY_LIB/switchyard_config_cli.py" "$key" "$default" 2>/dev/null \
-      || printf '%s\n' "$default"
+    "${SWITCHYARD_PYTHON:-python3}" "$SY_LIB/switchyard_config_cli.py" "$key" "$default" \
+      2>/dev/null || printf '%s\n' "$default"
   else
     printf '%s\n' "$default"
   fi
@@ -50,8 +55,8 @@ sy_cfg() {
 sy_cfg_trusted() {
   local key="$1" default="$2"
   if _sy_config_present_trusted; then
-    python3 "$SY_LIB/switchyard_config_cli.py" --trusted-only "$key" "$default" 2>/dev/null \
-      || printf '%s\n' "$default"
+    "${SWITCHYARD_PYTHON:-python3}" "$SY_LIB/switchyard_config_cli.py" --trusted-only \
+      "$key" "$default" 2>/dev/null || printf '%s\n' "$default"
   else
     printf '%s\n' "$default"
   fi

@@ -6,8 +6,16 @@
 #   semantic tripwire no cloud CI can run.
 # Import preflight pins the tested tree to THIS checkout: PYTHONPATH=src wins
 # over the main checkout's editable install, and we verify it.
+#
+# Interpreter: SWITCHYARD_PYTHON (env var) wins if set, else switchyard.toml's
+# `python` key (via sy_cfg), else a bare "python3" - adapt cfg.python (or
+# export SWITCHYARD_PYTHON) if your project needs a specific interpreter,
+# e.g. a venv that isn't on PATH.
 set -eu
-PY=/Users/storslasken/Developer/EV4XL-SIM/.venv/bin/python
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/config_get.sh
+source "$SCRIPT_DIR/../lib/config_get.sh"
+PY="${SWITCHYARD_PYTHON:-$(sy_cfg python python3)}"
 export PYTHONPATH="$PWD/src"
 export EV4XL_SKIP_DASH_BOOTSTRAP=1
 

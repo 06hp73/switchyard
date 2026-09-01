@@ -114,3 +114,45 @@ def test_wip_cap_configurable_via_switchyard_toml(tmp_path):
     # "2/5" regardless, so this line only comes out right if the configured
     # cap actually took effect.
     assert proc.stdout.strip() == "WIP: 2/2 live tracks."
+
+
+def test_wip_status_counts_against_configured_protected_branch(tmp_path):
+    # wip_status.sh used to hardcode "main" for its merge-base/ahead checks
+    # (`git rev-list --count main..$br`, `git diff --quiet main $br`). A repo
+    # whose trunk is actually called "trunk" would have `main` resolve to
+    # nothing at all: `git rev-list` on a nonexistent revision fails, the
+    # `|| echo 0` fallback kicks in, and "claude/live" would be silently
+    # reported as 0 commits ahead - i.e. not live - even though it plainly
+    # is. This proves protected_branch is actually threaded through instead.
+    repo = tmp_path / "r"
+    repo.mkdir()
+    git(repo, "init", "-b", "trunk")
+    (repo / "shared.txt").write_text("line1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "base")
+
+    git(repo, "checkout", "-b", "claude/live", "trunk")
+    (repo / "live.txt").write_text("still going\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "live change")
+    git(repo, "checkout", "trunk")
+
+    config = tmp_path / "switchyard.toml"
+    config.write_text('[switchyard]\nprotected_branch = "trunk"\n')
+
+    proc = subprocess.run(
+        ["bash", str(WIP_STATUS_SCRIPT)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={
+            **ENV,
+            "HOME": str(repo),
+            "PATH": _VENV_BIN + ":" + ENV["PATH"],
+            "SWITCHYARD_CONFIG": str(config),
+        },
+        timeout=10,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "WIP: 1/5 live tracks."
