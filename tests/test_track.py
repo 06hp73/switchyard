@@ -6,11 +6,12 @@ still create the branch + worktree and push it, and `track done` needs
 `--force-local` to skip the "PR is MERGED" check gh would otherwise perform.
 """
 
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "train"))
 
 CLI_SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "cli.py"
 
@@ -226,7 +227,11 @@ def test_track_done_refuses_when_train_lock_held(tmp_path):
     # train would be checking out branches into - interleaved with a live
     # train run it could delete a branch mid-merge or corrupt its checkout.
     # It must take the same .train/lock the train itself uses and refuse
-    # cleanly if held.
+    # cleanly if held - held for real here via the same flock _acquire_lock
+    # takes in production (the lock is a kernel-managed fcntl.flock lease
+    # now; a hand-written pid file on disk means nothing to it).
+    from merge_train import _acquire_lock, _release_lock
+
     origin, repo = make_world(tmp_path)
     worktree_root = tmp_path / "worktrees"
     write_config(repo, worktree_root)
@@ -234,13 +239,13 @@ def test_track_done_refuses_when_train_lock_held(tmp_path):
     assert new.returncode == 0, new.stderr
     wt_path = worktree_root / "locked-out"
 
-    lock = repo / ".train" / "lock"
-    lock.mkdir(parents=True)
-    (lock / "pid").write_text(str(os.getpid()))
-
-    done = run_cli(
-        "track", "done", "locked-out", "--repo", str(repo), "--force-local", home=tmp_path
-    )
+    lock = _acquire_lock(repo)
+    try:
+        done = run_cli(
+            "track", "done", "locked-out", "--repo", str(repo), "--force-local", home=tmp_path
+        )
+    finally:
+        _release_lock(lock)
 
     assert done.returncode == 2
     assert "busy" in done.stdout.lower()

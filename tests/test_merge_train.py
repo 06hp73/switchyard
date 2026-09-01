@@ -161,7 +161,12 @@ def test_gate_timeout_rejects(tmp_path):
     assert origin_main(origin) == before
 
 
-def test_stale_lock_reclaimed(tmp_path):
+def test_run_train_migrates_legacy_directory_lock(tmp_path):
+    # Pre-flock .train/lock was a directory (mkdir-mutex + a pid file
+    # inside it). A repo that still has one of those lying around from
+    # before this fix must not break on the very first run afterward -
+    # _acquire_lock clears it out of the way and proceeds as a normal
+    # fresh acquire.
     origin, station = make_world(tmp_path)
     lock = station / ".train" / "lock"
     lock.mkdir(parents=True)
@@ -172,259 +177,214 @@ def test_stale_lock_reclaimed(tmp_path):
 
 def test_live_lock_refuses(tmp_path):
     origin, station = make_world(tmp_path)
-    lock = station / ".train" / "lock"
-    lock.mkdir(parents=True)
-    (lock / "pid").write_text(str(os.getpid()))
-    with pytest.raises(SystemExit):
-        run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"])
+    from merge_train import _acquire_lock, _release_lock
+
+    lock = _acquire_lock(station)
+    try:
+        with pytest.raises(SystemExit):
+            run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"])
+    finally:
+        _release_lock(lock)
 
 
-# --- lock mutual exclusion (C2: the pid file itself is the mutex) -----------
+# --- lock mutual exclusion (C2 final: a kernel-managed flock lease) ---------
+#
+# .train/lock is now a plain file held with fcntl.flock(LOCK_EX | LOCK_NB) -
+# see merge_train._acquire_lock's docstring for why this replaces the
+# earlier os.link + pid-file reclaim scheme: a verification audit proved
+# that scheme's dead-holder reclaim path let 2-3 processes believe they
+# held the lock at once under contention (6/40 trials). flock has no
+# reclaim path at all - the kernel drops it unconditionally when every fd
+# referencing it closes, including on a crash - so there is nothing left
+# to get wrong.
 
 
-def test_acquire_lock_live_pid_refuses(tmp_path):
-    from merge_train import _acquire_lock
-
-    lock_dir = tmp_path / ".train" / "lock"
-    lock_dir.mkdir(parents=True)
-    (lock_dir / "pid").write_text(str(os.getpid()))
-
-    with pytest.raises(SystemExit):
-        _acquire_lock(tmp_path)
-
-
-def test_acquire_lock_dead_pid_reclaims_and_proceeds(tmp_path):
-    from merge_train import _acquire_lock
-
-    lock_dir = tmp_path / ".train" / "lock"
-    lock_dir.mkdir(parents=True)
-    (lock_dir / "pid").write_text("99999999")
-
-    lock = _acquire_lock(tmp_path)
-
-    assert lock == lock_dir
-    assert int((lock_dir / "pid").read_text().strip()) == os.getpid()
-
-
-def test_acquire_lock_is_mutually_exclusive_until_released(tmp_path):
-    # The pid file itself is the mutex (an O_EXCL atomic create), not just
-    # the containing directory existing: two sequential acquires on the same
-    # repo with no release in between must refuse the second - proving real
-    # exclusion, not just "a directory happens to be there already".
+def test_lock_second_acquire_refuses_while_held(tmp_path):
+    # flock is scoped to the open file description, not the process: even
+    # a second _acquire_lock call from this SAME process (a fresh open(),
+    # a different fd) must conflict with the first one and refuse. This is
+    # the exact distinction between fcntl.flock and fcntl.lockf/F_SETLK -
+    # a same-process lockf re-acquire would silently succeed instead (and
+    # worse, a lockf lock is dropped early if ANY other fd to the same
+    # file is ever closed by that process), which would make it useless as
+    # a cross-process mutex. This test pins the choice of flock.
     from merge_train import _acquire_lock, _release_lock
 
     lock = _acquire_lock(tmp_path)
+    try:
+        with pytest.raises(SystemExit):
+            _acquire_lock(tmp_path)
+    finally:
+        _release_lock(lock)
 
-    with pytest.raises(SystemExit):
-        _acquire_lock(tmp_path)
 
+def test_lock_released_allows_reacquire(tmp_path):
+    from merge_train import _acquire_lock, _release_lock
+
+    lock = _acquire_lock(tmp_path)
     _release_lock(lock)
 
-    # Released: a subsequent acquire must succeed again.
     lock2 = _acquire_lock(tmp_path)
-    assert lock2 == lock
     _release_lock(lock2)
 
 
-def test_acquire_lock_reclaim_race_loss_is_treated_as_held(tmp_path, monkeypatch):
-    # Simulates the exact race the atomic-pidfile fix exists to close: a
-    # dead holder is found (eligible for reclaim), but between our unlink of
-    # its stale pidfile and our own retry os.link(), another reclaimer wins
-    # first (publishes its own complete pid file first). Our retry link
-    # must then lose for real (not silently succeed and hand out a second
-    # lock) and we must refuse cleanly - never an uncaught FileExistsError
-    # bubbling out of a "concurrent reclaimers" race.
-    #
-    # The injection point is os.unlink (not os.open/os.link): under the
-    # atomic-link scheme, the only os.open call this code makes on the pid
-    # file's path is a plain read (_read_pid, via Path.read_text) - the
-    # publish step itself is os.link(tmp, pid_file), a different syscall
-    # entirely. The realistic place a concurrent reclaimer's publish can
-    # slot in is the instant right after THIS process frees the name by
-    # unlinking the stale pid file, before its own retry link runs.
-    from merge_train import _acquire_lock
-
-    lock_dir = tmp_path / ".train" / "lock"
-    lock_dir.mkdir(parents=True)
-    pid_file = lock_dir / "pid"
-    pid_file.write_text("99999999\n")  # dead - eligible for reclaim
-
-    real_unlink = os.unlink
-    target = str(pid_file)
-
-    def racy_unlink(path, *args, **kwargs):
-        result = real_unlink(path, *args, **kwargs)
-        if str(path) == target:
-            # A concurrent reclaimer publishes its own (live, alive) pid
-            # file the instant after we freed the name - a real hardlink
-            # publish, exactly like the real code's own, so it is just as
-            # complete and trustworthy.
-            competitor_tmp = lock_dir / "pid.competitor.tmp"
-            competitor_tmp.write_text(f"{os.getpid()}\n")
-            try:
-                os.link(competitor_tmp, pid_file)
-            finally:
-                os.unlink(competitor_tmp)
-        return result
-
-    monkeypatch.setattr(os, "unlink", racy_unlink)
-
-    with pytest.raises(SystemExit):
-        _acquire_lock(tmp_path)
-
-
-def test_lock_no_double_acquire_under_empty_pidfile_window(tmp_path):
-    """The exact C2 hole a verification audit reproduced: try_create() used
-    to do os.open(O_CREAT|O_EXCL) and a SEPARATE os.write(pid) as two
-    distinct syscalls. Between them the pid file exists but is EMPTY. A
-    second acquirer's own create then loses the O_EXCL race, reads the
-    empty file, gets None back from _read_pid, and the old code treated
-    None exactly like "dead holder" - unlinking the winner's in-progress
-    file and reclaiming while the winner was still actively holding the
-    lock. The audit drove that up to 4 concurrent "winners" on the reclaim
-    path.
-
-    This test manufactures that exact window directly (no timing race
-    needed - an empty pid file IS the bug regardless of how it got there)
-    and asserts a fresh _acquire_lock refuses instead of reclaiming. Under
-    the fixed atomic-publish-via-os.link scheme a pid file is only ever
-    created already-complete (linked in from a fully-written temp file), so
-    an empty one can only be external tampering, never an in-flight
-    competitor - and must never be treated as "dead".
-    """
-    from merge_train import _acquire_lock
-
-    lock_dir = tmp_path / ".train" / "lock"
-    lock_dir.mkdir(parents=True)
-    pid_file = lock_dir / "pid"
-    # Deliberately create-then-leave-empty: exactly the old two-step
-    # scheme's in-flight window, captured as a static fixture.
-    fd = os.open(pid_file, os.O_CREAT | os.O_WRONLY, 0o644)
-    os.close(fd)
-    assert pid_file.exists()
-    assert pid_file.read_text() == ""
-
-    with pytest.raises(SystemExit):
-        _acquire_lock(tmp_path)
-
-    # Refused, not reclaimed: a reclaim would have unlinked this file and
-    # published our own pid in its place.
-    assert pid_file.exists()
-    assert pid_file.read_text() == ""
-
-
-def test_lock_live_holder_refuses(tmp_path):
-    from merge_train import _acquire_lock
-
-    lock_dir = tmp_path / ".train" / "lock"
-    lock_dir.mkdir(parents=True)
-    (lock_dir / "pid").write_text(f"{os.getpid()}\n")
-
-    with pytest.raises(SystemExit):
-        _acquire_lock(tmp_path)
-
-
-def test_lock_dead_pid_reclaimed(tmp_path):
-    from merge_train import _acquire_lock
-
-    lock_dir = tmp_path / ".train" / "lock"
-    lock_dir.mkdir(parents=True)
-    (lock_dir / "pid").write_text("99999999\n")  # non-empty, well-formed, dead
-
-    lock = _acquire_lock(tmp_path)
-
-    assert lock == lock_dir
-    assert int((lock_dir / "pid").read_text().strip()) == os.getpid()
-
-
-def test_two_sequential_acquires_second_refuses_until_release(tmp_path):
+def test_lock_migrates_legacy_directory_lock(tmp_path):
+    # Same scenario as test_run_train_migrates_legacy_directory_lock above,
+    # exercised directly against _acquire_lock rather than through a full
+    # run_train call.
     from merge_train import _acquire_lock, _release_lock
 
+    legacy = tmp_path / ".train" / "lock"
+    legacy.mkdir(parents=True)
+    (legacy / "pid").write_text("12345\n")
+
     lock = _acquire_lock(tmp_path)
-    with pytest.raises(SystemExit):
-        _acquire_lock(tmp_path)
-
-    _release_lock(lock)
-    lock2 = _acquire_lock(tmp_path)
-    assert lock2 == lock
-    _release_lock(lock2)
+    try:
+        assert (tmp_path / ".train" / "lock").is_file()
+    finally:
+        _release_lock(lock)
 
 
-def test_lock_no_leaked_temp_files_after_acquire_and_release(tmp_path):
-    # The atomic-publish scheme writes a per-process pid.<pid>.tmp file
-    # before linking it into place - it must never survive past the call
-    # that created it, on the success path or the refuse path.
+def test_lock_survives_holder_crash(tmp_path):
+    # SIGKILLing the holder proves the whole stale-lock class is gone: the
+    # kernel drops a flock unconditionally the instant the last fd
+    # referencing it closes, including via a signal the process never got
+    # a chance to handle - there is no pid to record, no liveness check to
+    # run, and therefore no reclaim decision anyone could get wrong.
     from merge_train import _acquire_lock, _release_lock
 
-    lock = _acquire_lock(tmp_path)
-    assert list(lock.glob("*.tmp")) == []
-    _release_lock(lock)
-
-    # _release_lock rmdir's the now-empty container - recreate it to force
-    # the second acquire down the refuse path instead.
-    lock.mkdir(parents=True, exist_ok=True)
-    (lock / "pid").write_text(f"{os.getpid()}\n")
-    with pytest.raises(SystemExit):
-        _acquire_lock(tmp_path)
-    assert list(lock.glob("*.tmp")) == []
-
-
-def test_lock_concurrent_acquire_at_most_one_winner(tmp_path):
-    """Concurrency probe for the same hole: spawn real OS processes (the bug
-    is a cross-process filesystem race, not a threading one) that all race
-    to acquire the same fresh lock directory, and assert at most one ever
-    wins. Repeated across many independent trials because the old bug's
-    window (between two syscalls) was microscopic - a single trial could
-    get lucky and miss it even against the unfixed code, which is exactly
-    why test_lock_no_double_acquire_under_empty_pidfile_window above exists
-    as the deterministic, always-reproducible regression test; this probe
-    is an additional, best-effort net, not the primary proof.
-    """
-    # A winner must stay alive and HOLD the lock for a bit before releasing
-    # it - if it acquired and exited immediately instead, its pid would
-    # legitimately go dead a moment later and a slower sibling would then
-    # correctly RECLAIM the now-abandoned lock (the same behavior
-    # test_lock_dead_pid_reclaimed exists to prove is correct), which would
-    # show up here as ">1 winner" without being the C2 race at all. The
-    # sleep is what makes "still holding" and "already reclaimable" mean
-    # different things during the window every sibling makes its one
-    # attempt in - i.e. it is what turns this into a true concurrent-hold
-    # test rather than a sequential-handoff one.
-    worker = tmp_path / "_lock_worker.py"
-    worker.write_text(
+    holder_src = (
         "import sys, time\n"
         f"sys.path.insert(0, {str(MERGE_TRAIN_SCRIPT.parent)!r})\n"
         "from pathlib import Path\n"
+        "from merge_train import _acquire_lock\n"
+        "lock = _acquire_lock(Path(sys.argv[1]))\n"  # must stay referenced: GC-ing the
+        # returned handle would close its fd and drop the flock immediately
+        "print('HELD', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", holder_src, str(tmp_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        line = proc.stdout.readline()
+        assert line.strip() == "HELD", f"holder failed to start: stderr={proc.stderr.read()}"
+
+        # Sanity check: the lock really is held right now - otherwise
+        # killing the holder below wouldn't prove anything about
+        # auto-release.
+        with pytest.raises(SystemExit):
+            _acquire_lock(tmp_path)
+
+        proc.kill()  # SIGKILL on POSIX - no chance to run any cleanup at all
+        proc.wait(timeout=10)
+
+        lock = _acquire_lock(tmp_path)  # must succeed immediately - no reclaim needed
+        _release_lock(lock)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_lock_true_concurrency(tmp_path):
+    """The regression net for the flock design itself: spawn many real OS
+    processes that all race a real start barrier to acquire ONE fresh
+    .train/lock at the same instant, and prove the kernel never lets more
+    than one of them hold it at once - not "at most one eventually wins"
+    but genuinely never more than one open at any sampled instant while the
+    others are still in flight.
+
+    This is the shape of test the old os.link + pid-file scheme could still
+    fail under contention (a verification audit measured 2-3 concurrent
+    holders, 6/40 trials, on that scheme's dead-holder reclaim path,
+    because unlinking a stale pid file and retrying the atomic link were
+    two separate steps a competitor could interleave with). flock has no
+    decide-then-act window for a fresh acquisition, and no reclaim path at
+    all for a dead one (see test_lock_survives_holder_crash) - so this is
+    expected to hold cleanly on every single trial, and a failure here
+    would mean the wrong flock flags were used (e.g. LOCK_SH instead of
+    LOCK_EX), not a timing fluke.
+
+    Looped 20 times, 14 processes per trial, with a filesystem-based start
+    barrier (each worker announces itself, then busy-waits until all 14
+    have announced) so the workers actually race each other instead of
+    trickling in one at a time behind normal process-launch jitter.
+    """
+    race_worker_src = (
+        "import os, sys, time\n"
+        f"sys.path.insert(0, {str(MERGE_TRAIN_SCRIPT.parent)!r})\n"
+        "from pathlib import Path\n"
         "from merge_train import _acquire_lock, _release_lock\n"
+        "repo_dir = Path(sys.argv[1])\n"
+        "barrier_dir = Path(sys.argv[2])\n"
+        "results_path = Path(sys.argv[3])\n"
+        "n_workers = int(sys.argv[4])\n"
+        "(barrier_dir / f'r{os.getpid()}').touch()\n"
+        "deadline = time.monotonic() + 10\n"
+        "while len(list(barrier_dir.iterdir())) < n_workers and time.monotonic() < deadline:\n"
+        "    time.sleep(0.001)\n"
         "try:\n"
-        "    lock = _acquire_lock(Path(sys.argv[1]))\n"
-        "    print('WON')\n"
-        "    sys.stdout.flush()\n"
-        "    time.sleep(1.0)\n"
-        "    _release_lock(lock)\n"
+        "    lock = _acquire_lock(repo_dir)\n"
         "except SystemExit:\n"
         "    print('LOST')\n"
+        "    sys.exit(0)\n"
+        "with open(results_path, 'a') as fh:\n"
+        "    fh.write(f'{os.getpid()}\\n')\n"
+        "time.sleep(0.2)\n"
+        "remaining = [ln for ln in results_path.read_text().splitlines()"
+        " if ln.strip() != str(os.getpid())]\n"
+        "results_path.write_text('\\n'.join(remaining) + ('\\n' if remaining else ''))\n"
+        "_release_lock(lock)\n"
+        "print('WON')\n"
     )
-    n_workers = 8
-    for trial in range(10):
-        trial_dir = tmp_path / f"trial{trial}"
-        trial_dir.mkdir()
+
+    n_workers = 14
+    for trial in range(20):
+        trial_dir = tmp_path / f"race{trial}"
+        repo_dir = trial_dir / "repo"
+        barrier_dir = trial_dir / "barrier"
+        repo_dir.mkdir(parents=True)
+        barrier_dir.mkdir()
+        results_path = trial_dir / "results.txt"
+        results_path.write_text("")
+
         procs = [
             subprocess.Popen(
-                [sys.executable, str(worker), str(trial_dir)],
+                [
+                    sys.executable,
+                    "-c",
+                    race_worker_src,
+                    str(repo_dir),
+                    str(barrier_dir),
+                    str(results_path),
+                    str(n_workers),
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             for _ in range(n_workers)
         ]
+
+        max_held = 0
+        while any(p.poll() is None for p in procs):
+            held = len([ln for ln in results_path.read_text().splitlines() if ln.strip()])
+            max_held = max(max_held, held)
+            time.sleep(0.005)
+
         outcomes = []
         for p in procs:
             out, err = p.communicate(timeout=30)
             outcomes.append(out.strip())
             assert p.returncode == 0, f"trial {trial} worker crashed: {err}"
-        wins = outcomes.count("WON")
-        assert wins <= 1, f"trial {trial}: {wins} concurrent winners (outcomes={outcomes})"
+
+        assert max_held <= 1, f"trial {trial}: {max_held} lock holders visible at once"
+        assert outcomes.count("WON") == 1, f"trial {trial}: outcomes={outcomes}"
+        assert outcomes.count("LOST") == n_workers - 1, f"trial {trial}: outcomes={outcomes}"
 
 
 def test_missing_gate_binary_is_error_and_queue_continues(tmp_path):

@@ -8,10 +8,11 @@ deliberately excludes any real `gh`).
 """
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "train"))
 
 CLI_SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "cli.py"
 
@@ -244,18 +245,23 @@ def test_propose_revert_refuses_when_train_lock_held(tmp_path):
     # propose-revert mutates the SAME checkout a running train would be
     # using (fetch/checkout/revert/push) - interleaved with a live train run
     # it could corrupt that run's own in-flight state. It must take the same
-    # .train/lock the train itself uses and refuse cleanly if held.
+    # .train/lock the train itself uses and refuse cleanly if held - held
+    # for real here via the same flock _acquire_lock takes in production
+    # (the lock is a kernel-managed fcntl.flock lease now; a hand-written
+    # pid file on disk means nothing to it).
+    from merge_train import _acquire_lock, _release_lock
+
     origin, station = make_world(tmp_path)
     (station / "app.txt").write_text("v2 - the landed change\n")
     git(station, "commit", "-am", "landed change to revert")
     git(station, "push", "origin", "main")
     landed_sha = git(station, "rev-parse", "HEAD")
 
-    lock = station / ".train" / "lock"
-    lock.mkdir(parents=True)
-    (lock / "pid").write_text(str(os.getpid()))
-
-    proc = run_cli("propose-revert", landed_sha, "--repo", str(station), home=tmp_path)
+    lock = _acquire_lock(station)
+    try:
+        proc = run_cli("propose-revert", landed_sha, "--repo", str(station), home=tmp_path)
+    finally:
+        _release_lock(lock)
 
     assert proc.returncode == 2
     assert "busy" in proc.stdout.lower()

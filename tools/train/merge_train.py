@@ -96,8 +96,10 @@ by SwitchyardConfig's retry_flaky (default True) / --no-retry-flaky.
 State (at the repo root):
     .train/validated_trees.txt  - cache keys (tree hash + gate argv, hashed)
                                   whose gate already passed
-    .train/lock/                - mkdir-mutex (with pid file) so only one
-                                  train runs; stale locks are reclaimed
+    .train/lock                 - kernel-managed flock lease (fcntl.flock)
+                                  so only one train runs; the kernel frees
+                                  it automatically if the holder dies, so
+                                  there is nothing to reclaim
     .train/history.jsonl        - one JSON line per branch result (branch,
                                   status, detail_first_line, gate_seconds,
                                   tree, batch, ts) - see _append_history.
@@ -138,16 +140,19 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TextIO
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from notify import notify as _send_notification
@@ -230,182 +235,93 @@ def _state_dir(repo: Path) -> Path:
     return state
 
 
-def _pid_alive(pid: int) -> bool:
+def _acquire_lock(repo: Path) -> TextIO:
+    """Take the train's mutex: a kernel-managed flock lease on .train/lock.
+
+    .train/lock is a plain FILE (never a directory - see the migration
+    note below), held with fcntl.flock(LOCK_EX | LOCK_NB). This replaces
+    an earlier os.link + pid-file reclaim scheme (see git history around
+    the C2 fixes) whose entire design was to work out for itself whether a
+    pid recorded in a file was still alive, and reclaim the lock if not.
+    That "check liveness, then act" shape is exactly what a verification
+    audit exploited: unlinking a dead holder's stale pid file and retrying
+    the atomic link were two SEPARATE steps, so several processes that had
+    all independently decided the same holder was dead could interleave
+    their unlink-then-relink retries and each walk away believing it held
+    the lock - 2-3 concurrent "holders" in 6 of 40 trials under real
+    contention. flock closes the whole class of bug, not just that one
+    instance: it is a kernel object bound to the open file description,
+    never something this code writes to disk and later has to read back
+    and interpret, and the kernel drops it unconditionally the instant
+    every fd referencing it closes - including on SIGKILL or a crash, with
+    no window in between for anyone to observe "abandoned but not yet
+    freed". There is no stale lock, so there is nothing to reclaim and no
+    liveness check left to get wrong (see test_lock_survives_holder_crash).
+
+    POSIX only: fcntl.flock does not exist on Windows. Fine - this tool
+    targets macOS and Linux only.
+
+    Migration: a repo that ran the pre-flock code may still have
+    .train/lock sitting on disk as a DIRECTORY (with a pid file inside).
+    Nothing under it means anything to the flock scheme, so it is cleared
+    out of the way on sight rather than left to break the first open() on
+    an upgraded checkout.
+
+    Returns the open file object - THIS is the lock. It must be kept open
+    for as long as the caller wants to hold it (see run_train's finally)
+    and handed to _release_lock exactly once to free it.
+    """
+    lock_path = _state_dir(repo) / "lock"
+    if lock_path.is_dir():
+        shutil.rmtree(lock_path)
+
+    f = open(lock_path, "a+")
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        return False
-    return True
-
-
-def _read_pid(pid_file: Path) -> int | None:
-    try:
-        return int(pid_file.read_text().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def _acquire_lock(repo: Path) -> Path:
-    """Take the train's mutex: an atomically-published .train/lock/pid file.
-
-    The PID FILE is the actual mutex, not the containing directory. Two
-    earlier schemes both had a real race window:
-
-      - mkdir-the-lock-dir-then-separately-write-a-pid-file (the original
-        scheme) let a second process see the directory already exists, find
-        no pid file written yet, decide the lock was abandoned, and
-        rmtree+recreate it out from under a process still mid-acquisition -
-        proven exploitable in review (both trains then push the protected
-        branch).
-      - a single os.open(path, O_CREAT | O_EXCL | O_WRONLY) directly on the
-        pid file (the first C2 fix) closed that hole but opened a narrower
-        one: create and write were still two SEPARATE syscalls, so between
-        them the pid file existed but was EMPTY. A second acquirer whose own
-        O_EXCL create lost that race would read the empty file, get None
-        back from _read_pid, and the old code treated None exactly like "a
-        dead holder" - unlinking the winner's in-progress file and
-        reclaiming the lock while the winner was still actively publishing
-        it. A verification audit reproduced up to 4 concurrent "winners"
-        this way.
-
-    The fix: never let the pid file exist in an incomplete state at all.
-    The pid is written out fully to a per-process temp file first, and only
-    then published under the shared name via a single os.link() call -
-    POSIX's classic atomic test-and-set. There is no create-then-write
-    window to lose a race in, because all the writing happens on a name
-    nothing else can see; the link is the ONE indivisible step that makes
-    it visible, complete, under the shared name:
-
-      1. Write the pid, complete, to .train/lock/pid.<our pid>.tmp
-         (flushed and fsynced before the link).
-      2. os.link(tmp, pid_file). Success: we hold the lock. FileExistsError:
-         someone else already holds it - always a fully-formed file, never
-         a partial one, because this is the only way this code ever creates
-         it.
-
-    On losing that link: read whoever's pid is in there - that read is now
-    trustworthy, since an existing pid file was necessarily published
-    complete.
-      - A live holder is a normal, clean refusal (SystemExit).
-      - A pid file that EXISTS but does not parse (empty or garbage) can
-        never happen from this code's own publication path anymore - it is
-        external tampering, not an in-flight competitor, and is refused,
-        NEVER treated as "dead". This is the specific fix for the hole
-        above: an empty pid file now means refuse, not reclaim.
-      - A pid file that has vanished entirely (the holder released for real
-        between our failed link and this check) is genuinely free - nothing
-        to unlink, fall straight through to the retry below.
-      - A dead holder's pid file is unlinked and the SAME atomic link is
-        retried exactly once. If that retry also loses (another reclaimer
-        won first), that is simply treated as "held" and refused rather
-        than looping, which could spin forever under contention.
-
-    The per-process temp file is always removed - a try/finally around the
-    whole body covers every exit path (success, refusal, or an unexpected
-    exception) - so a leaked pid.<pid>.tmp never accumulates. It is created
-    O_TRUNC rather than O_EXCL: the name already carries our own pid, so the
-    only process that could ever collide with it is a long-dead one whose
-    same pid got reused by the OS and which itself already failed to clean
-    up - truncating and overwriting that leftover is strictly safer than
-    erroring out on it.
-
-    The directory itself (repo/.train/lock) is still created first (mkdir
-    with exist_ok=True) purely as the pid file's container - it carries no
-    locking semantics of its own, so two processes racing on that mkdir is
-    harmless (exist_ok=True lets both succeed).
-    """
-    lock = _state_dir(repo) / "lock"
-    lock.mkdir(exist_ok=True)
-    pid_file = lock / "pid"
-    tmp = lock / f"pid.{os.getpid()}.tmp"
-
-    def publish() -> bool:
-        try:
-            os.link(tmp, pid_file)
-        except FileExistsError:
-            return False
-        return True
-
-    try:
-        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
-        try:
-            os.write(fd, f"{os.getpid()}\n".encode())
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-        if publish():
-            return lock
-
-        holder = _read_pid(pid_file)
-        if holder is not None:
-            if _pid_alive(holder):
-                raise SystemExit(
-                    f"another train run holds .train/lock (held by pid {holder}; "
-                    "remove .train/lock if certain no train runs)"
-                ) from None
-            print(f"reclaimed stale train lock (pid {holder} dead)")
-            try:
-                os.unlink(pid_file)
-            except FileNotFoundError:
-                pass  # already gone - the retry below decides who actually wins it
-        elif pid_file.exists():
-            # Exists but did not parse (empty or garbage). Under this
-            # link-publish scheme that can only be external tampering, not
-            # an in-flight competitor - a real pid file is always complete
-            # from the instant it exists. Refuse rather than guess it is
-            # dead: this is the exact hole the old two-step
-            # create-then-write scheme had.
-            raise SystemExit(
-                "another train run holds .train/lock (pid file exists but is "
-                "empty or unreadable - refusing to treat that as a dead "
-                "holder; remove .train/lock if certain no train runs)"
-            ) from None
-        # else: pid_file no longer exists at all - released for real between
-        # our failed link and this check. Nothing to unlink; fall through to
-        # the retry below, same as after a genuine dead-holder reclaim.
-
-        if publish():
-            return lock
-
-        # Lost the reclaim race too: another process's link won between
-        # whatever freed the name (our unlink, or someone else releasing)
-        # and our retry. Whatever it published is the live lock now -
-        # refuse rather than loop, exactly like an ordinary live-holder
-        # refusal.
-        holder = _read_pid(pid_file)
+        # EWOULDBLOCK (raised as BlockingIOError, itself an OSError
+        # subclass): someone else already holds it. Whatever pid is in the
+        # file is read only for this message - purely informational, never
+        # trusted for any decision the way the old scheme's pid file was.
+        f.seek(0)
+        pid = f.read().strip() or "unknown"
+        f.close()
         raise SystemExit(
-            f"another train run holds .train/lock (held by pid {holder}; "
-            "remove .train/lock if certain no train runs)"
+            f"another train run holds .train/lock (held by pid {pid}; "
+            "the lock frees automatically when that process exits)"
         ) from None
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+
+    # Held. Publish our pid for the same informational purpose - nothing
+    # ever reads this back to make a locking decision, only to print a
+    # busy message to a human.
+    f.seek(0)
+    f.truncate()
+    f.write(f"{os.getpid()}\n")
+    f.flush()
+    return f
 
 
-def _release_lock(lock: Path) -> None:
-    """Release the train mutex: remove the pid file (the actual lock), then
-    tidy up the now-empty container directory.
+def _release_lock(handle: TextIO) -> None:
+    """Release the train mutex acquired by _acquire_lock: drop the flock,
+    close the fd.
 
-    Order matters: unlinking the pid file first is what actually frees the
-    mutex for the next acquirer. The directory removal after that is pure
-    tidiness and must never raise - rmdir refuses a non-empty directory
-    (e.g. a racing reclaimer recreated a pid file the instant after we
-    removed ours) and that is fine, there is nothing to clean up in that
-    case.
+    Not unlinking .train/lock is deliberate, not an oversight. flock's
+    exclusivity lives on the inode via the open file description, not on
+    the path - the lock is already fully released the moment this fd is
+    gone, regardless of whether the file still has a name. Unlinking it
+    would only invite a needless race: a concurrent acquirer that opened
+    the same path a moment before the unlink would go on to flock() an
+    inode nobody else can ever open again by that name.
+
+    Best-effort and silent throughout: releasing a lock must never itself
+    become the reason a train run reports an error.
     """
     try:
-        (lock / "pid").unlink()
-    except FileNotFoundError:
-        pass
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, ValueError):
+        pass  # ValueError: fileno() on an already-closed handle
     try:
-        lock.rmdir()
+        handle.close()
     except OSError:
         pass
 
