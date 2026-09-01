@@ -125,17 +125,41 @@ fi
 # own cwd) only when the destination is implicit. Blocks when ANY of:
 #   - an explicit ref token's destination equals $PROTECTED_BRANCH (bare
 #     name, "refs/heads/<branch>", or the right side of a "src:dst"
-#     colon-refspec, including the delete form ":<branch>") - quotes around
-#     the token are stripped first;
+#     colon-refspec, including the delete form ":<branch>") - ALL quote
+#     characters are stripped from the token first, wherever they sit in it
+#     (not just a surrounding pair): a real shell removes them the same
+#     way, so ma"in" and m"a"i"n" are both just "main" by the time git ever
+#     sees them, and comparing the still-quoted literal against the bare
+#     branch name would silently never match;
 #   - there is NO explicit refspec at all (bare "git push", "git push
 #     origin", "git push -u origin") and the current branch is
 #     $PROTECTED_BRANCH, or the current branch could not be determined
 #     (fail safe);
-#   - the token is bare "HEAD" (no colon) and the same current-branch check
-#     applies, since HEAD's destination is equally implicit.
-# Extracted as one "git push ..." segment per invocation, run up to the next
-# command separator (";", "&&", "||", "&", "|") or end of string - same
-# segmentation the other rules in this file use for chained commands.
+#   - the token is bare "HEAD" or "@" (no colon) - git treats "@" as a
+#     literal synonym for HEAD - and the same current-branch check applies,
+#     since both have an equally implicit destination;
+#   - the invocation carries -C <path>, -c <key>=<value>, --git-dir[=]<path>,
+#     or --work-tree[=]<path> BEFORE the push subcommand (any of which can
+#     point the push at a repo other than the one at $CWD) together with
+#     either an implicit destination (no explicit refspec, or a bare
+#     HEAD/@) or an explicit one naming $PROTECTED_BRANCH. $CURRENT_BRANCH
+#     below is always resolved from the HOOK's own cwd, which says nothing
+#     about what a -C/--git-dir-redirected invocation actually has checked
+#     out, so an implicit destination under one of these flags is refused
+#     outright rather than evaluated against the wrong repo's branch - a
+#     push that names an explicit, non-protected branch (e.g. "claude/x")
+#     is unambiguous regardless of which repo -C points at and stays
+#     allowed. This is deliberately narrow - exactly these four forms, not
+#     a general git global-option parser - because they are the ones that
+#     can change WHICH repo or identity a push acts against; an
+#     unrecognized global flag (say "--no-pager") in front of "push" falls
+#     back to the same not-classified-as-a-push gap this rule always had,
+#     unchanged.
+# Extracted as one "git ...push..." segment per invocation, starting at the
+# "git" token itself (so any global options in front of "push" are visible
+# to the tokenizer below) and running up to the next command separator
+# (";", "&&", "||", "&", "|") or end of string - same segmentation the
+# other rules in this file use for chained commands.
 if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ]; then
   CURRENT_BRANCH=""
   if [ -n "$CWD" ]; then
@@ -151,20 +175,46 @@ if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ]; then
   # subshell in bash, and block()'s `exit 2` would then only exit that
   # subshell, silently letting the push through. `< <(...)` keeps the loop
   # in the current shell so exit actually aborts the whole script.
-  while IFS= read -r PUSH_SEG; do
-    [ -z "$PUSH_SEG" ] && continue
-    # [[:>:]] (BSD word-end boundary), not \b: BSD sed (macOS) does not
-    # honor \b here (same quirk as the "rtk " stripping note above) - it
-    # silently fails to match at all when nothing follows "push", leaving
-    # PUSH_SEG completely unstripped and corrupting the tokenization below.
-    REST=$(printf '%s' "$PUSH_SEG" | sed -E 's/^git[[:space:]]+push[[:>:]]//')
+  while IFS= read -r GIT_SEG; do
+    [ -z "$GIT_SEG" ] && continue
     # shellcheck disable=SC2206 # word-splitting is intentional and safe:
-    # $REST was isolated to a single push invocation above, so it contains
-    # no ";"/"&"/"|" to mis-split on.
-    TOKENS=($REST)
+    # $GIT_SEG was isolated to a single git invocation above, so it
+    # contains no ";"/"&"/"|" to mis-split on. TOKENS[0] is literally "git".
+    TOKENS=($GIT_SEG)
+
+    # Walk past global options that can appear before the subcommand and
+    # change WHICH repo/identity this invocation targets. Anything else
+    # (an unrecognized flag, or the subcommand itself) stops the walk.
+    IDX=1
+    HAS_REPO_ALTERING_OPT=0
+    while [ "$IDX" -lt "${#TOKENS[@]}" ]; do
+      TOK="${TOKENS[$IDX]}"
+      case "$TOK" in
+        -C|-c)
+          HAS_REPO_ALTERING_OPT=1
+          IDX=$((IDX + 2)) # skip the flag AND its separate-argument value
+          ;;
+        --git-dir=*|--work-tree=*)
+          HAS_REPO_ALTERING_OPT=1
+          IDX=$((IDX + 1))
+          ;;
+        --git-dir|--work-tree)
+          HAS_REPO_ALTERING_OPT=1
+          IDX=$((IDX + 2))
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+
+    [ "$IDX" -lt "${#TOKENS[@]}" ] || continue  # ran off the end - no subcommand at all
+    [ "${TOKENS[$IDX]}" = "push" ] || continue  # subcommand isn't push - not our concern
+
+    REST=("${TOKENS[@]:$((IDX + 1))}")
 
     POSITIONAL=()
-    for TOK in "${TOKENS[@]}"; do
+    for TOK in "${REST[@]}"; do
       case "$TOK" in
         -*) : ;; # an option flag (-u, --force, --tags, ...), not a remote/refspec
         *) POSITIONAL+=("$TOK") ;;
@@ -175,16 +225,21 @@ if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ]; then
     if [ "${#POSITIONAL[@]}" -le 1 ]; then
       # No explicit refspec: bare "git push" / "git push origin" /
       # "git push -u origin" - destination is implicit.
-      if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "$PROTECTED_BRANCH" ]; then
+      if [ "$HAS_REPO_ALTERING_OPT" = "1" ]; then
+        # -C/-c/--git-dir/--work-tree may target a wholly different repo -
+        # $CURRENT_BRANCH speaks only for the hook's own cwd, so it cannot
+        # answer for that repo. Fail safe: never trust it here.
+        BLOCK_THIS=1
+      elif [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "$PROTECTED_BRANCH" ]; then
         BLOCK_THIS=1
       fi
     else
       for REFSPEC in "${POSITIONAL[@]:1}"; do
-        UNQ="$REFSPEC"
-        case "$UNQ" in
-          \"*\") UNQ="${UNQ#\"}"; UNQ="${UNQ%\"}" ;;
-          \'*\') UNQ="${UNQ#\'}"; UNQ="${UNQ%\'}" ;;
-        esac
+        # Strip EVERY quote character wherever it sits, not just a matched
+        # surrounding pair: a real shell does the same before git ever sees
+        # the token, so ma"in" and m"a"i"n" both collapse to plain main.
+        UNQ="${REFSPEC//\"/}"
+        UNQ="${UNQ//\'/}"
 
         DST="$UNQ"
         case "$UNQ" in
@@ -193,9 +248,15 @@ if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ]; then
 
         if [ "$DST" = "$PROTECTED_BRANCH" ] || [ "$DST" = "refs/heads/$PROTECTED_BRANCH" ]; then
           BLOCK_THIS=1
-        elif [ "$UNQ" = "HEAD" ] \
-             && { [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "$PROTECTED_BRANCH" ]; }; then
-          BLOCK_THIS=1
+        elif { [ "$UNQ" = "HEAD" ] || [ "$UNQ" = "@" ]; }; then
+          if [ "$HAS_REPO_ALTERING_OPT" = "1" ]; then
+            # HEAD/@ resolves against THAT invocation's own repo under -C/
+            # -c/--git-dir/--work-tree, which $CURRENT_BRANCH cannot speak
+            # to either - same fail-safe reasoning as the refspec-less case.
+            BLOCK_THIS=1
+          elif [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "$PROTECTED_BRANCH" ]; then
+            BLOCK_THIS=1
+          fi
         fi
       done
     fi
@@ -203,7 +264,7 @@ if [ "$MAIN_PUSH_GUARD_ACTIVE" = "1" ]; then
     if [ "$BLOCK_THIS" = "1" ]; then
       block "pushing to $PROTECTED_BRANCH is reserved for the merge train. Push your feature branch and mark the PR ready; the train lands it after testing the combined tree."
     fi
-  done < <(printf '%s' "$NORM" | grep -oE 'git[[:space:]]+push\b[^;&|]*')
+  done < <(printf '%s' "$NORM" | grep -oE 'git\b[^;&|]*')
 fi
 
 # .claude/worktrees is always checked, regardless of config - it is the

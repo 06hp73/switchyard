@@ -362,6 +362,85 @@ def test_blocks_quoted_main_refspec():
     assert_blocked("git push origin 'main'", "train")
 
 
+def test_blocks_interior_quoted_main_refspec():
+    # A real shell removes quote characters WHEREVER they sit in a word, not
+    # just when they wrap the whole token: ma"in" and m"a"i"n" both become
+    # the bare word "main" once actually run. The old stripping only
+    # handled a token that starts AND ends with a matching quote
+    # (\"*\"/'*') - neither of these tokens does, since the quotes sit
+    # inside the word, so the old code compared the literal 8/9-character
+    # quoted string against "main", never matched, and let the push through.
+    assert_blocked('git push origin ma"in"', "train")
+    assert_blocked('git push origin m"a"i"n"', "train")
+
+
+def test_blocks_bare_at_sign_as_head_alias_on_protected_branch(tmp_path):
+    # "@" is git's own shorthand for HEAD - "git push origin @" resolves
+    # exactly like "git push origin HEAD", which the guard already handled;
+    # "@" itself was never recognized as the same alias.
+    on_main = make_repo_on_branch(tmp_path, "at-on-main", "main")
+    assert_blocked("git push origin @", "train", cwd=str(on_main))
+
+    on_feature = make_repo_on_branch(tmp_path, "at-on-feature", "claude/z")
+    assert_allowed("git push origin @", cwd=str(on_feature))
+
+
+def test_blocks_dash_capital_c_push_to_main():
+    # "git -C <path> push ..." runs the push against a DIFFERENT repo, but
+    # the old extraction keyed on the literal substring "git push" being
+    # adjacent - "git -C /x push" was never even recognized as a push
+    # invocation at all and sailed through unclassified.
+    assert_blocked("git -C /some/other/repo push origin main", "train")
+
+
+def test_blocks_dash_c_config_push_to_main():
+    # Deliberately non-identity keys (foo=bar / core.pager=cat): a
+    # user.name=/user.email= value would ALSO trip the separate, unrelated
+    # identity-change rule, which would block for the wrong reason and mask
+    # whether this C3 fix itself is doing anything.
+    assert_blocked("git -c foo=bar push origin main", "train")
+    assert_blocked("git -c core.pager=cat push origin main", "train")
+
+
+def test_blocks_git_dir_and_work_tree_push_to_main():
+    # Paths deliberately avoid containing the substring "git" anywhere (no
+    # ".git", no "-git-"): the OLD extraction regex had no word-boundary
+    # before its own literal "git", so a value like "/x/.git" would
+    # accidentally, coincidentally self-match right there and get blocked
+    # for the wrong reason, masking whether recognizing --git-dir/
+    # --work-tree as flags is actually what is doing the blocking.
+    assert_blocked("git --git-dir=/x/other-repo push origin main", "train")
+    assert_blocked("git --git-dir /x/other-repo push origin main", "train")
+    assert_blocked("git --work-tree=/x/other-repo push origin main", "train")
+    assert_blocked("git --work-tree /x/other-repo push origin main", "train")
+
+
+def test_blocks_multiple_global_options_before_push():
+    assert_blocked("git -C /x -c foo=bar push origin main", "train")
+
+
+def test_dash_capital_c_push_to_feature_branch_still_allowed():
+    # -C must not become an automatic block for every push through it - an
+    # explicit, non-protected-naming refspec is still safe and stays
+    # allowed, exactly like it would with no -C at all.
+    assert_allowed("git -C /x push origin claude/x")
+
+
+def test_dash_c_push_to_feature_branch_still_allowed():
+    assert_allowed("git -c foo=bar push origin claude/x")
+
+
+def test_dash_capital_c_refspec_less_push_fails_safe(tmp_path):
+    # -C points at a possibly different repo; THIS process's cwd/branch says
+    # nothing about what is checked out there. A push with no explicit
+    # destination under -C must refuse rather than guess - even run from a
+    # cwd whose own current branch is an entirely harmless feature branch,
+    # since trusting that branch would be answering the wrong question.
+    on_feature = make_repo_on_branch(tmp_path, "dashC-refspecless", "claude/w")
+    assert_blocked("git -C /some/other/repo push origin", "train", cwd=str(on_feature))
+    assert_blocked("git -C /some/other/repo push", "train", cwd=str(on_feature))
+
+
 def test_bare_push_fail_safe_when_branch_undeterminable():
     # cwd="/tmp" is not a git repo (or at least not one whose branch this
     # test controls) - current branch can't be resolved, so a bare push
