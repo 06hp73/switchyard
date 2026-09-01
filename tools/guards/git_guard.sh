@@ -47,11 +47,33 @@ if [ -n "$CWD" ] && ORIGIN_URL=$(git -C "$CWD" remote get-url origin 2>/dev/null
   # ~/.config/switchyard/config.toml (both outside a PR author's control)
   # may override these two values.
   PRODUCT_MATCH=$(sy_cfg_trusted product_remote_match "")
-  [ -z "$PRODUCT_MATCH" ] && PRODUCT_MATCH="06hp73/EV4SIM"
-  case "$ORIGIN_URL" in
-    *"$PRODUCT_MATCH"*) : ;;  # the product repo - stays enforced
-    *) MAIN_PUSH_GUARD_ACTIVE=0 ;;
-  esac
+  # sy_cfg_trusted returns "" both when no trusted config exists at all (the
+  # common case - fall back to the hardcoded EV4SIM default below, unchanged
+  # from before this check existed) AND when a trusted config file DOES
+  # exist but no Python >=3.11 was available to read it (see
+  # config_get.sh's sy_cfg_trusted) - those two cases must NOT be treated
+  # the same way. Silently falling back to the EV4SIM default in the second
+  # case would be a real protection gap: someone who configured a custom
+  # product_remote_match for their OWN product repo would have that setting
+  # invisibly dropped, the guard would compare their repo's origin against
+  # "06hp73/EV4SIM" instead, find no match, and disable itself for the very
+  # repo it was configured to protect - silently. Recompute the same
+  # "config present but unparseable" condition sy_cfg_trusted already
+  # checked internally (both helpers are cheap/pure-bash-first, see
+  # config_get.sh) to tell the two apart, and fail safe the OTHER way in the
+  # unparseable case: enforce on every origin, matching the "empty means
+  # always enforce" fallback tools/guards/pre_push_hook.sh's is_product_remote
+  # already applies to this identical empty value - never disable the ban
+  # just because it could not be told what to scope itself to.
+  if [ -z "$PRODUCT_MATCH" ] && _sy_config_present_trusted && [ -z "$(sy_resolve_python)" ]; then
+    : # unparseable trusted config - stay enforced on every origin (no-op)
+  else
+    [ -z "$PRODUCT_MATCH" ] && PRODUCT_MATCH="06hp73/EV4SIM"
+    case "$ORIGIN_URL" in
+      *"$PRODUCT_MATCH"*) : ;;  # the product repo - stays enforced
+      *) MAIN_PUSH_GUARD_ACTIVE=0 ;;
+    esac
+  fi
 fi
 PROTECTED_BRANCH=$(sy_cfg_trusted protected_branch "main")
 

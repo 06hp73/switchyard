@@ -1,2 +1,16 @@
 #!/usr/bin/env bash
-exec "${SWITCHYARD_PYTHON:-python3}" "$(dirname "$0")/../tools/cli.py" "$@"
+# The CLI needs tomllib (Python 3.11+) to read switchyard.toml at all - see
+# tools/lib/switchyard_config.py. A bare "${SWITCHYARD_PYTHON:-python3}" used
+# to silently hand every guard-scoping lookup its hardcoded default on a
+# host whose ambient python3 predates 3.11 (e.g. macOS ships 3.9.6 at
+# /usr/bin/python3); resolve a real one first and refuse to run at all
+# rather than repeat that silently here.
+SY_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../tools/lib/resolve_python.sh
+source "$SY_BIN_DIR/../tools/lib/resolve_python.sh"
+SY_PYTHON="$(sy_resolve_python)"
+if [ -z "$SY_PYTHON" ]; then
+  echo "switchyard: no Python >=3.11 found (need tomllib); set SWITCHYARD_PYTHON" >&2
+  exit 1
+fi
+exec "$SY_PYTHON" "$SY_BIN_DIR/../tools/cli.py" "$@"
