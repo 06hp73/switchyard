@@ -30,7 +30,8 @@ demonstrably is not (Leßenich et al.).
 
 | Path | What it does |
 |---|---|
-| `tools/guards/git_guard.sh` | PreToolUse hook: blocks `git stash` (repo-global across worktrees — silently destroys other sessions' work), identity changes (`git config user.*`, `-c`, `--author`, env overrides), force pushes (incl. `+refspec`), any push to `main`, and `rm -rf` on worktree dirs. Fail-open on parse errors. |
+| `tools/guards/git_guard.sh` | PreToolUse hook: blocks `git stash` (repo-global across worktrees — silently destroys other sessions' work), identity changes (`git config user.*`, `-c`, `--author`, env overrides), force pushes (incl. `+refspec`), any push to `main`, and `rm -rf` on worktree dirs. Fail-open on parse errors. Best-effort text matching, hardened against realistic accidents — see "Enforcement model" below for why it is not, and cannot be, adversarially complete. |
+| `tools/guards/pre_push_hook.sh`, `tools/guards/install_pre_push.sh` | A real git `pre-push` hook plus its installer — the robust local enforcement layer for the protected branch, immune to the shell-text tricks that beat `git_guard.sh` because it reads git's own already-resolved refs instead of parsing command text. See "Enforcement model" below. |
 | `tools/guards/wip_status.sh` | Session-start banner: live (unmerged) track count vs the WIP cap. |
 | `tools/guards/worktree_env.sh` | Deterministic per-worktree port + Redis-DB allocation. |
 | `tools/guards/setup_pueue.sh` | pueue groups `solver`/`train` capped at 1 concurrent job machine-wide. |
@@ -49,11 +50,17 @@ demonstrably is not (Leßenich et al.).
 2. In the target repo's `.claude/settings.json`, add hooks that call the
    scripts by absolute path: `git_guard.sh` as a `PreToolUse` hook on Bash,
    `wip_status.sh` + `collision_radar.py` in `SessionStart`.
-3. Register the JSON merge driver where the train merges:
+3. Install the pre-push hook in every repo whose protected branch must
+   actually hold: `bash tools/guards/install_pre_push.sh --repo <path>`
+   (default: symlinked, so it upgrades whenever this checkout does; see its
+   `--mode copy`/`--force`/`--chain` for a repo that already has a
+   pre-push hook). This is the layer that still holds even when a shell
+   trick fools step 2's guard — see "Enforcement model" below.
+4. Register the JSON merge driver where the train merges:
    `git config merge.jsoncatalog.driver "python3 <path>/tools/train/json_merge_driver.py %O %A %B"`
    plus a `.gitattributes` line `your/catalog.json merge=jsoncatalog`.
-4. `bash tools/guards/setup_pueue.sh`, then `bash tools/train/setup_station.sh`.
-5. Land branches with
+5. `bash tools/guards/setup_pueue.sh`, then `bash tools/train/setup_station.sh`.
+6. Land branches with
    `python3 tools/train/merge_train.py run --repo <station> [--branch NAME]`
    (default candidates: open non-draft PRs against `main`, priority-labeled
    ones first, then oldest first by PR number), or the equivalent
@@ -61,6 +68,54 @@ demonstrably is not (Leßenich et al.).
    forwards straight to `merge_train.py run`.
    Exit codes: 0 = nothing errored (rejected/conflict are normal outcomes),
    1 = dry-run found a branch that would not land, 2 = a system error.
+
+## Enforcement model (defense in depth)
+
+Three separate layers stand between a session and the protected branch.
+They are not redundant copies of each other — each covers what the layer
+below it structurally cannot — and none of the three is, by itself, a
+security boundary:
+
+1. **`git_guard.sh` (the `PreToolUse` hook) is best-effort accident
+   prevention for a cooperative agent session, nothing more.** It
+   pattern-matches the TEXT of a Bash tool call before that command runs.
+   Text matching cannot be made adversarially complete: enough shell
+   cleverness — a quote placed mid-word, a backslash, a
+   `GIT_DIR=`/`GIT_WORK_TREE=` redirection, an alias, a line continuation,
+   `$(...)` substitution — constructs a command whose text reads as
+   something harmless while resolving to exactly the banned push. This
+   guard is hardened against the realistic, plausible mistakes a
+   cooperative agent could actually type (its own comments and
+   `tests/test_git_guard.py` track each one), and deliberately NOT chased
+   toward completeness against a determined adversary, because that is the
+   wrong tool for that job. Do not rely on it to stop a determined shell —
+   it exists to catch an honest mistake before it happens, cheaply, for
+   every session, on every command.
+2. **`pre_push_hook.sh` (installed by `install_pre_push.sh`, step 3 above)
+   is the robust LOCAL layer.** It is a real git `pre-push` hook, so it
+   runs INSIDE git itself, after git has already resolved every ref and
+   remote the push actually touches. By the time it sees a ref, every env
+   var, quote, backslash, and redirection flag from the original command
+   line has already been expanded and interpreted by git — not re-parsed,
+   approximately, by this hook's own text matching. It catches what layer
+   1 structurally cannot (`tests/test_pre_push_hook.py` proves this against
+   a real bare repo, including one of the exact bypasses that defeats
+   layer 1). Its own honest limits: `git push --no-verify` skips any
+   client-side git hook outright, and a hook only protects the one repo it
+   is actually installed into. Neither of those is a gap specific to this
+   hook — every local git hook that has ever existed shares them.
+3. **Server-side branch protection (a ruleset on the remote host — required
+   status checks, restrict-who-can-push, block force-pushes and direct
+   pushes) is the actual wall.** It is the only layer of the three a pusher
+   cannot opt out of from their own client, because nothing about it runs
+   on their machine at all. Layers 1 and 2 exist to catch a mistake BEFORE
+   it reaches the server — a faster, friendlier failure for a session to
+   hit than a rejected push — but the server ruleset is what actually holds
+   if either of them is missing, disabled, or bypassed (`--no-verify`, an
+   uninstalled hook, a guard fooled by its own text parsing). Keep the
+   server ruleset on regardless of whether layers 1 and 2 are installed;
+   install layer 2 everywhere it matters as defense in depth on top of
+   layer 1, never as a substitute for layer 3.
 
 Convention that makes it all work: sessions open **draft** PRs while working
 and mark them **ready** to queue for the train; `main` is never pushed by
@@ -158,7 +213,7 @@ of crashing — a broken config must never brick a guard. See
 
 ## Tests
 
-129 tests, plain pytest, no project dependencies (needs Python 3.11+ for
+218 tests, plain pytest, no project dependencies (needs Python 3.11+ for
 `tomllib` — see `tools/lib/switchyard_config.py`):
 
 ```bash
