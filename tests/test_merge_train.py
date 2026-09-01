@@ -619,6 +619,55 @@ def test_pr_squash_head_moved_after_gating_is_rejected(tmp_path, monkeypatch):
     assert origin_main(origin) == before
 
 
+# --- _looks_like_head_mismatch must not livelock on a required-check reject (I12)
+
+
+def test_looks_like_head_mismatch_excludes_required_status_check_phrasing():
+    from merge_train import _looks_like_head_mismatch
+
+    # A permanently-blocked-by-ruleset rejection that happens to also
+    # mention "head" (and, under the old word list, "changed") - reclassify
+    # this as head-moved and a PR that can never pass its required checks
+    # re-queues forever instead of ever landing as a plain "rejected".
+    assert not _looks_like_head_mismatch(
+        "required status check has not changed state on head commit"
+    )
+
+
+def test_looks_like_head_mismatch_still_detects_real_head_moved_wording():
+    from merge_train import _looks_like_head_mismatch
+
+    assert _looks_like_head_mismatch("Head branch was modified. Review and try the merge again.")
+
+
+def test_pr_squash_required_status_check_mentioning_head_is_rejected_not_requeued(
+    tmp_path, monkeypatch
+):
+    # A required-status-check rejection can itself mention "head" (e.g. "...
+    # has not changed state on head commit") - this must classify as a
+    # normal blocked rejection, never the head-moved re-queue path (which
+    # would livelock a PR that can never pass its required checks).
+    origin, station = make_world(tmp_path)
+    before = origin_main(origin)
+    fake_gh = write_fake_gh(tmp_path)
+    monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
+    monkeypatch.setenv("FAKE_GH_PR_NUMBER", "9")
+    monkeypatch.setenv("FAKE_GH_MERGE_MODE", "fail")
+    monkeypatch.setenv(
+        "FAKE_GH_FAIL_MESSAGE",
+        "required status check has not changed state on head commit",
+    )
+
+    results = run_train(
+        repo=station, branches=["claude/good"], gate=["/usr/bin/true"], land="pr-squash"
+    )
+
+    assert results[0].status == "rejected"
+    assert results[0].detail != "head moved after gating - re-queue"
+    assert "required status check" in results[0].detail
+    assert origin_main(origin) == before
+
+
 def test_cli_dry_run_red_exits_1(tmp_path):
     origin, station = make_world(tmp_path)
     cli = [sys.executable, str(MERGE_TRAIN_SCRIPT), "run", "--repo", str(station)]

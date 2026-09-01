@@ -431,16 +431,26 @@ def _looks_like_head_mismatch(gh_output: str) -> bool:
     modified. Review and try the merge again." is the text at time of
     writing) - matched loosely (case-insensitive "head" plus a
     change-of-state word) so small upstream wording drift does not silently
-    fall back to the generic "gh pr merge failed" detail. A false negative
-    here still lands as a normal "rejected" outcome with the more generic
-    detail text - never a wrongly-landed branch - so verify this heuristic
-    against a real `gh` refusal before leaning on the specific detail text
-    for automation.
+    fall back to the generic "gh pr merge failed" detail.
+
+    "required status check" is excluded up front even though it can also
+    mention "head" and "changed" (e.g. "required status check has not
+    changed state on head commit"): that is a permanently-blocked-by-ruleset
+    rejection, not a stale SHA, and misclassifying it as head-moved re-queues
+    a PR that can never pass its required checks - an infinite livelock, not
+    a transient race. The trigger-word list also no longer includes the bare
+    word "changed" for the same reason: it is generic enough to appear in
+    all sorts of unrelated status-change wording, which is exactly what
+    caused this false positive in the first place. When the wording is
+    ambiguous, this prefers "rejected" (a stop) over "head moved" (a retry):
+    a false negative here just falls back to the generic "rejected" detail -
+    never a wrongly-landed branch - so verify this heuristic against a real
+    `gh` refusal before leaning on the specific detail text for automation.
     """
     lowered = gh_output.lower()
-    return "head" in lowered and any(
-        word in lowered for word in ("match", "modified", "moved", "changed")
-    )
+    if "required status check" in lowered:
+        return False
+    return "head" in lowered and any(word in lowered for word in ("match", "modified", "moved"))
 
 
 def _squash_one(
