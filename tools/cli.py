@@ -2,23 +2,30 @@
 
 Subcommands:
     switchyard status [--repo PATH]
-        A `notify: <mode>` line (SwitchyardConfig.notify, see
-        tools/lib/notify.py) followed by one composed, read-only terminal
-        view: WIP (live tracks vs the configured cap), RADAR (conflict
-        pairs), QUEUE (open PRs via gh, ready vs draft, priority-labeled
-        marked), FLAKY (.train/flaky_log.jsonl - process_branch's retry-
-        rescued gates, see merge_train.py's _append_flaky_log; this only
-        ever reads it), LAST LANDINGS (the tail of .train/history.jsonl,
-        humanized). Every section is independently defensive: a missing
-        file, an absent `gh`, or an unreadable repo degrades that ONE
-        section to a one-line explanation and never takes the rest of the
-        view down with it.
+        Always starts with the resolved `repo:` path and whether `.train/`
+        exists there (see _resolve_status_repo - B3), so an empty view can
+        never be mistaken for "all quiet" when it actually means "looked in
+        the wrong directory", then a `notify: <mode>` line
+        (SwitchyardConfig.notify, see tools/lib/notify.py) followed by one
+        composed, read-only terminal view: WIP (live tracks vs the
+        configured cap), RADAR (conflict pairs), QUEUE (open PRs via gh,
+        ready vs draft, priority-labeled marked), FLAKY
+        (.train/flaky_log.jsonl - process_branch's retry-rescued gates, see
+        merge_train.py's _append_flaky_log; this only ever reads it), LAST
+        LANDINGS (the tail of .train/history.jsonl, humanized). Every
+        section is independently defensive: a missing file, an absent `gh`,
+        or an unreadable repo degrades that ONE section to a one-line
+        explanation and never takes the rest of the view down with it.
+        Without --repo, defaults to the configured [switchyard].station
+        (where the train's own .train/ state actually lives) rather than
+        bare cwd - see _resolve_status_repo.
 
     switchyard stats [--repo PATH] [--days N]
-        Aggregates .train/history.jsonl (see tools/train/merge_train.py's
-        _append_history) over the last N days (default 14): counts per
-        status, landing rate/day, mean + p90 gate_seconds, and the most
-        frequently rejected branches.
+        Same `repo:`/`.train/:` opening line and --repo default as `status`
+        above. Aggregates .train/history.jsonl (see
+        tools/train/merge_train.py's _append_history) over the last N days
+        (default 14, must be >= 1): counts per status, landing rate/day,
+        mean + p90 gate_seconds, and the most frequently rejected branches.
 
     switchyard radar [...]
     switchyard land [...]
@@ -251,10 +258,38 @@ def _print_last_landings_section(repo: Path) -> None:
         )
 
 
+def _resolve_status_repo(explicit: Path | None) -> Path:
+    """--repo's resolution for `status`/`stats` only (B3): an explicit
+    --repo always wins; otherwise prefer the configured [switchyard].station
+    over bare cwd.
+
+    Train state (.train/history.jsonl, .train/flaky_log.jsonl) lives in
+    whichever repo actually RAN the train - almost always the station clone
+    (see switchyard.toml's `station` field, cmd_watch_install's own use of
+    it), which is rarely the same directory a human happens to be sitting
+    in when they type `switchyard status`. Defaulting to cwd in that case
+    does not error - it just silently renders an EMPTY view of a directory
+    that was never the train's own working copy, indistinguishable from
+    "all quiet" unless you already know to be suspicious. cmd_status/
+    cmd_stats also always print the repo path this resolves to, plus
+    whether .train/ exists there, so a genuinely empty view can never be
+    mistaken for "we looked in the wrong place" (or vice versa).
+    """
+    if explicit is not None:
+        return explicit.resolve()
+    cwd = Path.cwd()
+    cfg = load_config(cwd)
+    if cfg.station:
+        return Path(cfg.station).expanduser().resolve()
+    return cwd
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    repo = args.repo.resolve()
+    repo = _resolve_status_repo(args.repo)
     cfg = load_config(repo)
 
+    print(f"repo: {repo}")
+    print(f".train/: {'present' if (repo / '.train').is_dir() else 'NOT present'}")
     print(f"notify: {cfg.notify}")
     print()
     print("== WIP ==")
@@ -292,12 +327,14 @@ def _percentile(sorted_values: list[float], pct: float) -> float:
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
-    repo = args.repo.resolve()
+    repo = _resolve_status_repo(args.repo)
     # Clamped, not just validated at the argparse layer (see _positive_days
     # below): a caller that builds its own Namespace and invokes cmd_stats
     # directly - bypassing argparse's own type check entirely - must never
     # hit the ZeroDivisionError `landed / days` used to raise for days <= 0.
     days = max(1, args.days)
+    print(f"repo: {repo}")
+    print(f".train/: {'present' if (repo / '.train').is_dir() else 'NOT present'}")
     print(f"switchyard stats - last {days} day(s)")
 
     entries = _read_jsonl(repo / ".train" / "history.jsonl")
@@ -956,11 +993,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_status = sub.add_parser("status", help="composed view: WIP, radar, queue, flaky, landings")
-    p_status.add_argument("--repo", type=Path, default=Path.cwd())
+    # default=None (not Path.cwd()): _resolve_status_repo tells "not passed"
+    # apart from "passed the literal cwd" and prefers the configured station
+    # in the former case - see its own docstring (B3).
+    p_status.add_argument("--repo", type=Path, default=None)
     p_status.set_defaults(func=cmd_status)
 
     p_stats = sub.add_parser("stats", help="landing-history stats from .train/history.jsonl")
-    p_stats.add_argument("--repo", type=Path, default=Path.cwd())
+    p_stats.add_argument("--repo", type=Path, default=None)
     p_stats.add_argument("--days", type=_positive_days, default=DEFAULT_STATS_DAYS)
     p_stats.set_defaults(func=cmd_stats)
 

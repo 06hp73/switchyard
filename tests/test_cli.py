@@ -73,13 +73,16 @@ def origin_main(origin: Path) -> str:
     return git(origin, "rev-parse", "main")
 
 
-def run_cli(*args: str, home: Path, timeout: int = 30) -> subprocess.CompletedProcess:
+def run_cli(
+    *args: str, home: Path, timeout: int = 30, cwd: Path | None = None
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(CLI_SCRIPT), *args],
         capture_output=True,
         text=True,
         env={**ENV, "HOME": str(home)},
         timeout=timeout,
+        cwd=cwd,
         check=False,
     )
 
@@ -179,6 +182,111 @@ def test_status_shows_configured_notify_mode(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert "notify: macos" in proc.stdout
+
+
+def test_status_always_prints_resolved_repo_and_train_dir_presence(tmp_path):
+    # B3: an empty status view (no .train/ yet) must never be mistaken for
+    # "all quiet" - the resolved repo path and whether .train/ exists there
+    # are always the first two lines, regardless of what else is going on.
+    _origin, station = make_world(tmp_path)
+
+    proc = run_cli("status", "--repo", str(station), home=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"repo: {station.resolve()}" in proc.stdout
+    assert ".train/: NOT present" in proc.stdout  # make_world's station never ran a train
+
+    (station / ".train").mkdir()
+    proc = run_cli("status", "--repo", str(station), home=tmp_path)
+    assert ".train/: present" in proc.stdout
+
+
+# --- switchyard status/stats: --repo defaults to cfg.station, not cwd (B3) ----
+#
+# Train state (.train/history.jsonl, .train/flaky_log.jsonl) lives in
+# whichever repo actually ran the train - the station clone
+# (switchyard.toml's `station` field) - which is rarely the directory a
+# human happens to be sitting in when they type `switchyard status`.
+# Without an explicit --repo, that must be preferred over bare cwd.
+
+
+def test_status_without_explicit_repo_defaults_to_configured_station(tmp_path):
+    _origin, station = make_world(tmp_path)
+
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "switchyard"
+    config_dir.mkdir(parents=True)
+    config_dir.joinpath("config.toml").write_text(f'[switchyard]\nstation = "{station}"\n')
+
+    # A neutral, non-git cwd: proves resolution comes from the configured
+    # station, never from wherever the command happened to be invoked.
+    neutral_cwd = tmp_path / "somewhere-else"
+    neutral_cwd.mkdir()
+
+    proc = run_cli("status", home=home, cwd=neutral_cwd)
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"repo: {station.resolve()}" in proc.stdout
+    assert "claude/good" in proc.stdout  # WIP section - proves it looked at the STATION
+
+
+def test_stats_without_explicit_repo_defaults_to_configured_station(tmp_path):
+    station = tmp_path / "station"
+    station.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(station)],
+        check=True,
+        capture_output=True,
+        env=ENV,
+    )
+    train_dir = station / ".train"
+    train_dir.mkdir()
+    entry = {
+        "branch": "claude/x",
+        "status": "landed",
+        "detail_first_line": "",
+        "gate_seconds": 1.0,
+        "tree": "t1",
+        "batch": 1,
+        "ts": time.time(),
+    }
+    (train_dir / "history.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "switchyard"
+    config_dir.mkdir(parents=True)
+    config_dir.joinpath("config.toml").write_text(f'[switchyard]\nstation = "{station}"\n')
+
+    neutral_cwd = tmp_path / "somewhere-else"
+    neutral_cwd.mkdir()
+
+    proc = run_cli("stats", "--days", "1", home=home, cwd=neutral_cwd)
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"repo: {station.resolve()}" in proc.stdout
+    assert "1 landing attempt" in proc.stdout
+
+
+def test_status_explicit_repo_still_wins_over_configured_station(tmp_path):
+    _origin, station = make_world(tmp_path)
+
+    other = tmp_path / "not-the-station"
+    other.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(other)], check=True, capture_output=True, env=ENV
+    )
+
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "switchyard"
+    config_dir.mkdir(parents=True)
+    # station points at the real station, but an explicit --repo must win.
+    config_dir.joinpath("config.toml").write_text(f'[switchyard]\nstation = "{station}"\n')
+
+    proc = run_cli("status", "--repo", str(other), home=home)
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"repo: {other.resolve()}" in proc.stdout
+    assert "claude/good" not in proc.stdout  # did NOT silently look at the station instead
 
 
 # --- switchyard stats ---------------------------------------------------------
