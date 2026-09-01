@@ -6,6 +6,7 @@ still create the branch + worktree and push it, and `track done` needs
 `--force-local` to skip the "PR is MERGED" check gh would otherwise perform.
 """
 
+import os
 import subprocess
 import sys
 import time
@@ -215,3 +216,34 @@ def test_track_new_and_done_survive_a_full_round_trip(tmp_path):
     done = run_cli("track", "done", name, "--repo", str(repo), "--force-local", home=tmp_path)
     assert done.returncode == 0, done.stderr
     assert not (worktree_root / name).exists()
+
+
+# --- track done refuses while the train lock is held (I10) ------------------
+
+
+def test_track_done_refuses_when_train_lock_held(tmp_path):
+    # track done deletes local/remote branches on the SAME repo a running
+    # train would be checking out branches into - interleaved with a live
+    # train run it could delete a branch mid-merge or corrupt its checkout.
+    # It must take the same .train/lock the train itself uses and refuse
+    # cleanly if held.
+    origin, repo = make_world(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    write_config(repo, worktree_root)
+    new = run_cli("track", "new", "locked-out", "--repo", str(repo), home=tmp_path)
+    assert new.returncode == 0, new.stderr
+    wt_path = worktree_root / "locked-out"
+
+    lock = repo / ".train" / "lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(str(os.getpid()))
+
+    done = run_cli(
+        "track", "done", "locked-out", "--repo", str(repo), "--force-local", home=tmp_path
+    )
+
+    assert done.returncode == 2
+    assert "busy" in done.stdout.lower()
+    # Refused before anything was touched.
+    assert wt_path.is_dir()
+    assert git(repo, "rev-parse", "--verify", "claude/locked-out")

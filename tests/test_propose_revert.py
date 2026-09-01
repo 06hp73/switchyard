@@ -8,6 +8,7 @@ deliberately excludes any real `gh`).
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -234,3 +235,31 @@ def test_propose_revert_gh_stub_uses_draft(tmp_path):
     assert call[call.index("--head") + 1] == f"revert-{landed_sha[:7]}"
     assert call[call.index("--base") + 1] == "main"
     assert "draft PR opened" in proc.stdout
+
+
+# --- propose-revert refuses while the train lock is held (I10) --------------
+
+
+def test_propose_revert_refuses_when_train_lock_held(tmp_path):
+    # propose-revert mutates the SAME checkout a running train would be
+    # using (fetch/checkout/revert/push) - interleaved with a live train run
+    # it could corrupt that run's own in-flight state. It must take the same
+    # .train/lock the train itself uses and refuse cleanly if held.
+    origin, station = make_world(tmp_path)
+    (station / "app.txt").write_text("v2 - the landed change\n")
+    git(station, "commit", "-am", "landed change to revert")
+    git(station, "push", "origin", "main")
+    landed_sha = git(station, "rev-parse", "HEAD")
+
+    lock = station / ".train" / "lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(str(os.getpid()))
+
+    proc = run_cli("propose-revert", landed_sha, "--repo", str(station), home=tmp_path)
+
+    assert proc.returncode == 2
+    assert "busy" in proc.stdout.lower()
+    # Refused before anything was touched: no revert branch, still on main.
+    branch = f"revert-{landed_sha[:7]}"
+    assert not git_ok(station, "rev-parse", "--verify", branch)
+    assert git(station, "rev-parse", "--abbrev-ref", "HEAD") == "main"

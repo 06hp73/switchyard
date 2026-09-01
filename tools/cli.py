@@ -525,48 +525,64 @@ def cmd_track_done(args: argparse.Namespace) -> int:
         print(f"[dry-run] would delete remote branch: origin/{branch}")
         return 0
 
-    if worktree_path is not None and Path(worktree_path).exists():
-        # No --force: git itself refuses when the worktree has local
-        # modifications or untracked files, which IS the "refuse if dirty"
-        # check - no need to duplicate that logic here.
-        remove = subprocess.run(
-            ["git", "-C", str(repo), "worktree", "remove", str(worktree_path)],
+    # Everything past this point mutates `repo`'s own checkout/branches - the
+    # same repo a running train may be mid-`fetch`/`checkout`/`reset --hard`
+    # on. Take the train's own lock first so the two can never interleave
+    # (see merge_train.py's _acquire_lock); dry-run above needs none of this,
+    # it touches nothing.
+    try:
+        lock = merge_train._acquire_lock(repo)
+    except SystemExit as exc:
+        print(f"switchyard track done: train busy, try later ({exc})")
+        return 2
+
+    try:
+        if worktree_path is not None and Path(worktree_path).exists():
+            # No --force: git itself refuses when the worktree has local
+            # modifications or untracked files, which IS the "refuse if
+            # dirty" check - no need to duplicate that logic here.
+            remove = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "remove", str(worktree_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if remove.returncode != 0:
+                print(f"switchyard track done: worktree remove refused: {remove.stderr.strip()}")
+                return 2
+
+        # -D, not -d: this repo's convention is squash-merge onto the
+        # protected branch, so the track branch's own commits never become
+        # reachable from main's ancestry - `git branch -d`'s "is this
+        # merged" check would refuse every single track branch by design,
+        # even ones that landed cleanly, so -D is the correct (not just the
+        # forceful) choice here.
+        delete_local = subprocess.run(
+            ["git", "-C", str(repo), "branch", "-D", branch],
             capture_output=True,
             text=True,
             check=False,
         )
-        if remove.returncode != 0:
-            print(f"switchyard track done: worktree remove refused: {remove.stderr.strip()}")
+        if delete_local.returncode != 0:
+            print(
+                f"switchyard track done: could not delete local branch: "
+                f"{delete_local.stderr.strip()}"
+            )
             return 2
 
-    # -D, not -d: this repo's convention is squash-merge onto the protected
-    # branch, so the track branch's own commits never become reachable from
-    # main's ancestry - `git branch -d`'s "is this merged" check would
-    # refuse every single track branch by design, even ones that landed
-    # cleanly, so -D is the correct (not just the forceful) choice here.
-    delete_local = subprocess.run(
-        ["git", "-C", str(repo), "branch", "-D", branch],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if delete_local.returncode != 0:
-        print(
-            f"switchyard track done: could not delete local branch: {delete_local.stderr.strip()}"
+        delete_remote = subprocess.run(
+            ["git", "-C", str(repo), "push", "origin", "--delete", branch],
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        return 2
-
-    delete_remote = subprocess.run(
-        ["git", "-C", str(repo), "push", "origin", "--delete", branch],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if delete_remote.returncode != 0:
-        print(
-            f"switchyard track done: remote branch delete skipped/failed (tolerated): "
-            f"{delete_remote.stderr.strip()[:200]}"
-        )
+        if delete_remote.returncode != 0:
+            print(
+                f"switchyard track done: remote branch delete skipped/failed (tolerated): "
+                f"{delete_remote.stderr.strip()[:200]}"
+            )
+    finally:
+        merge_train._release_lock(lock)
 
     print(f"track {name} cleaned up.")
     return 0
@@ -741,94 +757,115 @@ def cmd_propose_revert(args: argparse.Namespace) -> int:
     command's whole job is handing over the evidence (a real, tested revert
     branch, plus whatever --reason file explains why) as fast as possible,
     not making the call.
+
+    The fetch/checkout/revert/push sequence mutates the SAME checkout a
+    running train may be using - it takes the train's own .train/lock first
+    (see merge_train.py's _acquire_lock) so the two can never interleave and
+    corrupt each other's in-flight state, and releases it again before the
+    (read-only-local, network-only) --reason file read and `gh pr create`.
     """
     repo = args.repo.resolve()
     cfg = load_config(repo)
     protected = cfg.protected_branch
     sha = args.sha
 
-    fetch = subprocess.run(
-        ["git", "-C", str(repo), "fetch", "origin", "--prune"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if fetch.returncode != 0:
-        print(f"switchyard propose-revert: git fetch failed: {fetch.stderr.strip()}")
+    try:
+        lock = merge_train._acquire_lock(repo)
+    except SystemExit as exc:
+        print(f"switchyard propose-revert: train busy, try later ({exc})")
         return 2
 
-    # Resolved before anything is created, so a bad/unknown sha fails fast
-    # without leaving a half-built branch behind.
-    subject_proc = subprocess.run(
-        ["git", "-C", str(repo), "log", "-1", "--format=%s", sha],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    subject = subject_proc.stdout.strip()
-    if subject_proc.returncode != 0 or not subject:
-        print(f"switchyard propose-revert: could not resolve {sha}: {subject_proc.stderr.strip()}")
-        return 2
-
-    branch = f"revert-{sha[:7]}"
-
-    # -B (not -b): resets `branch` to origin/<protected>'s tip even if a
-    # same-named branch is already sitting around from a previous attempt,
-    # so this command is safely re-runnable without a manual cleanup first.
-    checkout = subprocess.run(
-        ["git", "-C", str(repo), "checkout", "-B", branch, f"origin/{protected}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if checkout.returncode != 0:
-        print(
-            f"switchyard propose-revert: could not create branch {branch}: "
-            f"{checkout.stderr.strip()}"
+    try:
+        fetch = subprocess.run(
+            ["git", "-C", str(repo), "fetch", "origin", "--prune"],
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        return 2
+        if fetch.returncode != 0:
+            print(f"switchyard propose-revert: git fetch failed: {fetch.stderr.strip()}")
+            return 2
 
-    revert = subprocess.run(
-        ["git", "-C", str(repo), "revert", "--no-edit", sha],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if revert.returncode != 0:
-        # Clean up completely rather than leave a half-reverted branch lying
-        # around: abort the in-progress revert, return to `protected`, and
-        # delete the branch this attempt created - nothing pushed yet, so
-        # there is nothing remote to undo.
-        subprocess.run(
-            ["git", "-C", str(repo), "revert", "--abort"], capture_output=True, check=False
+        # Resolved before anything is created, so a bad/unknown sha fails
+        # fast without leaving a half-built branch behind.
+        subject_proc = subprocess.run(
+            ["git", "-C", str(repo), "log", "-1", "--format=%s", sha],
+            capture_output=True,
+            text=True,
+            check=False,
         )
+        subject = subject_proc.stdout.strip()
+        if subject_proc.returncode != 0 or not subject:
+            print(
+                f"switchyard propose-revert: could not resolve {sha}: {subject_proc.stderr.strip()}"
+            )
+            return 2
+
+        branch = f"revert-{sha[:7]}"
+
+        # -B (not -b): resets `branch` to origin/<protected>'s tip even if a
+        # same-named branch is already sitting around from a previous
+        # attempt, so this command is safely re-runnable without a manual
+        # cleanup first.
+        checkout = subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-B", branch, f"origin/{protected}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if checkout.returncode != 0:
+            print(
+                f"switchyard propose-revert: could not create branch {branch}: "
+                f"{checkout.stderr.strip()}"
+            )
+            return 2
+
+        revert = subprocess.run(
+            ["git", "-C", str(repo), "revert", "--no-edit", sha],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if revert.returncode != 0:
+            # Clean up completely rather than leave a half-reverted branch
+            # lying around: abort the in-progress revert, return to
+            # `protected`, and delete the branch this attempt created -
+            # nothing pushed yet, so there is nothing remote to undo.
+            subprocess.run(
+                ["git", "-C", str(repo), "revert", "--abort"], capture_output=True, check=False
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "checkout", protected], capture_output=True, check=False
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "branch", "-D", branch], capture_output=True, check=False
+            )
+            print(
+                f"switchyard propose-revert: revert of {sha} conflicts - cleaned up, "
+                f"no branch left behind. Resolve by hand:\n{revert.stderr.strip()[:400]}"
+            )
+            return 2
+
+        push = subprocess.run(
+            ["git", "-C", str(repo), "push", "-u", "origin", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if push.returncode != 0:
+            print(
+                f"switchyard propose-revert: push failed (branch still local): "
+                f"{push.stderr.strip()}"
+            )
+            return 2
+
+        # Back to a clean, known baseline - same convention merge_train.py's
+        # process_branch always follows after it is done with a branch.
         subprocess.run(
             ["git", "-C", str(repo), "checkout", protected], capture_output=True, check=False
         )
-        subprocess.run(
-            ["git", "-C", str(repo), "branch", "-D", branch], capture_output=True, check=False
-        )
-        print(
-            f"switchyard propose-revert: revert of {sha} conflicts - cleaned up, "
-            f"no branch left behind. Resolve by hand:\n{revert.stderr.strip()[:400]}"
-        )
-        return 2
-
-    push = subprocess.run(
-        ["git", "-C", str(repo), "push", "-u", "origin", branch],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if push.returncode != 0:
-        print(f"switchyard propose-revert: push failed (branch still local): {push.stderr.strip()}")
-        return 2
-
-    # Back to a clean, known baseline - same convention merge_train.py's
-    # process_branch always follows after it is done with a branch.
-    subprocess.run(
-        ["git", "-C", str(repo), "checkout", protected], capture_output=True, check=False
-    )
+    finally:
+        merge_train._release_lock(lock)
 
     reason_text = ""
     if args.reason:
