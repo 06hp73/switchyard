@@ -108,13 +108,23 @@ State (at the repo root):
                                   guarantee as history.jsonl.
 
 Usage:
-    python tools/train/merge_train.py run [--repo PATH] [--branch NAME ...]
+    python tools/train/merge_train.py run --repo PATH [--branch NAME ...]
         [--gate CMD] [--gate-timeout SECONDS] [--land {push,pr-squash}]
-        [--batch N] [--dry-run]
+        [--batch N] [--dry-run] [--allow-dirty]
 Without --branch, candidates come from
     gh pr list --state open --draft=false --base main
 ordered with any priority-labeled PRs first, then oldest first (FIFO by PR
 number) within each group.
+
+--repo has no cwd default and is required: every branch `run`/`land`
+processes gets `git reset --hard`, so a forgotten --repo defaulting to
+whatever directory the command happened to run in - e.g. a live work
+worktree - would silently destroy uncommitted work there. A repo that is
+neither bare nor the exact path configured as [switchyard].station is also
+refused up front if its working tree is dirty (`git status --porcelain`
+nonempty), unless --allow-dirty is passed: those are the two shapes of repo
+this file expects to freely reset, everything else is someone's real
+checkout.
 
 Exit codes: 0 nothing errored (rejected/conflict branches are a normal
 result, not a failure); 1 only under --dry-run, when some branch would not
@@ -1095,11 +1105,68 @@ def run_train(
     return results
 
 
+def _repo_is_bare(repo: Path) -> bool:
+    """True if `repo` is a bare git repository - no working tree, so it can
+    never be "dirty" in the sense this file cares about."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--is-bare-repository"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def _repo_is_dirty(repo: Path) -> bool:
+    """True if `repo` has uncommitted changes to TRACKED files (staged or
+    unstaged) - exactly what `git reset --hard` can destroy.
+
+    Untracked files are deliberately excluded: `reset --hard` never touches
+    them (only `git clean` does), so they are not the risk this check
+    exists to catch - and this file's own .train/ bookkeeping directory
+    (lock/, validated_trees.txt, history.jsonl, ...) is untracked debris in
+    any repo that has no .gitignore entry for it, which would otherwise trip
+    this check as "dirty" the moment a train run ever wrote to it, on the
+    very first run.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def _repo_matches_configured_station(repo: Path, cfg) -> bool:
+    """True only if `repo` IS the exact clone [switchyard].station names.
+
+    Not "any repo that happens to be configured somewhere" - the station is
+    the one clone this whole toolkit is built to freely `git reset --hard`,
+    so it is exempt from the dirty-working-tree refusal the same way a bare
+    repo is. An unset station never matches anything.
+    """
+    if not cfg.station:
+        return False
+    try:
+        return repo.resolve() == Path(cfg.station).expanduser().resolve()
+    except OSError:
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
     run_parser = sub.add_parser("run")
-    run_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    run_parser.add_argument(
+        "--repo",
+        type=Path,
+        required=True,
+        help="the station clone to run the train against - required, never "
+        "defaults to cwd: every branch processed gets `git reset --hard`, so "
+        "an accidental cwd default inside a live work worktree would destroy "
+        "uncommitted work there",
+    )
     run_parser.add_argument("--branch", action="append", default=None)
     run_parser.add_argument("--gate", type=str, default=None)
     run_parser.add_argument("--gate-timeout", type=int, default=None)
@@ -1112,9 +1179,33 @@ def main() -> int:
         help="disable process_branch's identical-gate retry-once on failure "
         "(overrides switchyard.toml's retry_flaky for this run only)",
     )
+    run_parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="allow running against a non-bare, non-station repo whose working "
+        "tree has uncommitted changes (run/land `git reset --hard` the "
+        "checkout and would discard them) - not needed for a bare repo or "
+        "the exact path configured as [switchyard].station",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.repo)
+
+    if (
+        not args.allow_dirty
+        and not _repo_is_bare(args.repo)
+        and not _repo_matches_configured_station(args.repo, cfg)
+        and _repo_is_dirty(args.repo)
+    ):
+        print(
+            f"switchyard train: refusing to run against {args.repo} - its working "
+            "tree has uncommitted changes and `run`/`land` will `git reset --hard` "
+            "it, destroying them. Commit or stash first, point --repo at the "
+            "actual station clone, or pass --allow-dirty if you are certain this "
+            "is safe."
+        )
+        return 2
+
     if args.gate:
         gate = shlex.split(args.gate)
     elif cfg.gate_fast:

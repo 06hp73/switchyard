@@ -641,6 +641,143 @@ def test_cli_dry_run_red_exits_1(tmp_path):
     assert real_run.returncode == 0, real_run.stderr
 
 
+# --- --repo is required, and a dirty non-station repo is refused (I4) -------
+#
+# `run`/`land` `git reset --hard` the checkout on every branch processed - a
+# forgotten --repo defaulting to cwd inside a live work worktree would
+# silently destroy uncommitted work there. status/stats/radar keep defaulting
+# --repo to cwd (they are read-only); only run/land are affected.
+
+
+def test_run_without_repo_is_a_clear_error(tmp_path):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(MERGE_TRAIN_SCRIPT),
+            "run",
+            "--branch",
+            "claude/good",
+            "--gate",
+            "/usr/bin/true",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "--repo" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_run_refuses_dirty_non_station_repo(tmp_path):
+    origin, station = make_world(tmp_path)
+    (station / "app.txt").write_text("uncommitted local change\n")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(MERGE_TRAIN_SCRIPT),
+            "run",
+            "--repo",
+            str(station),
+            "--branch",
+            "claude/good",
+            "--gate",
+            "/usr/bin/true",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "dirty" in (proc.stdout + proc.stderr).lower()
+    # Refused before run_train ever touched the checkout: the uncommitted
+    # change must survive untouched, not get reset --hard away.
+    assert (station / "app.txt").read_text() == "uncommitted local change\n"
+
+
+def test_run_allow_dirty_overrides_refusal(tmp_path):
+    origin, station = make_world(tmp_path)
+    (station / "app.txt").write_text("uncommitted local change\n")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(MERGE_TRAIN_SCRIPT),
+            "run",
+            "--repo",
+            str(station),
+            "--branch",
+            "claude/good",
+            "--gate",
+            "/usr/bin/true",
+            "--allow-dirty",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert git(origin, "show", "main:good.txt") == "good change"
+
+
+def test_run_allows_dirty_configured_station_without_allow_dirty(tmp_path):
+    # A repo matching [switchyard].station exactly is trusted the way a
+    # freshly-cloned station is: it exists purely to be reset --hard, so a
+    # dirty state (e.g. left behind by a previous crashed run) is not a
+    # reason to refuse it the way an arbitrary work worktree would be.
+    origin, station = make_world(tmp_path)
+    (station / "app.txt").write_text("dirty from a previous crashed run\n")
+    config = tmp_path / "switchyard.toml"
+    config.write_text(f'[switchyard]\nstation = "{station}"\n')
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(MERGE_TRAIN_SCRIPT),
+            "run",
+            "--repo",
+            str(station),
+            "--branch",
+            "claude/good",
+            "--gate",
+            "/usr/bin/true",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "SWITCHYARD_CONFIG": str(config)},
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert git(origin, "show", "main:good.txt") == "good change"
+
+
+def test_land_passthrough_without_repo_is_a_clear_error(tmp_path):
+    # switchyard land routes straight into merge_train's own `run` argparse
+    # (see tools/cli.py's cmd_land) - the same --repo requirement must apply
+    # there too, with no separate implementation to drift out of sync.
+    cli_script = Path(__file__).resolve().parents[1] / "tools" / "cli.py"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(cli_script),
+            "land",
+            "--branch",
+            "claude/good",
+            "--gate",
+            "/usr/bin/true",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "--repo" in proc.stderr
+
+
 def test_batch_one_is_byte_equivalent_to_unbatched(tmp_path):
     # Same scenario as test_green_branch_lands, with batch=1 spelled out
     # explicitly: the batch parameter must not change the plain path at all.
