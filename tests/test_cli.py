@@ -91,7 +91,7 @@ def run_cli(
 
 
 def test_status_renders_all_sections_without_gh(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
 
     proc = run_cli("status", "--repo", str(station), home=tmp_path)
 
@@ -124,7 +124,7 @@ def test_status_survives_missing_train_dir_and_bad_repo_path(tmp_path):
 
 
 def test_status_defaults_to_notify_none(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
 
     proc = run_cli("status", "--repo", str(station), home=tmp_path)
 
@@ -175,7 +175,7 @@ def test_status_flaky_section_degrades_gracefully_for_pre_fix_entries(tmp_path):
 
 
 def test_status_shows_configured_notify_mode(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     (station / "switchyard.toml").write_text('[switchyard]\nnotify = "macos"\n')
 
     proc = run_cli("status", "--repo", str(station), home=tmp_path)
@@ -489,7 +489,7 @@ def test_stats_omits_the_cap_note_when_history_is_small(tmp_path, capsys):
 
 
 def test_radar_passthrough_reports_conflicts_json(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
 
     proc = run_cli("radar", "--repo", str(station), "--json", home=tmp_path)
 

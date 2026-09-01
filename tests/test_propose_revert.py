@@ -101,7 +101,7 @@ def test_propose_revert_creates_branch_matching_pre_commit_tree(tmp_path):
 
 
 def test_propose_revert_pr_title_uses_original_subject(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     (station / "app.txt").write_text("v2\n")
     git(station, "commit", "-am", "a very specific commit subject")
     git(station, "push", "origin", "main")
@@ -116,7 +116,7 @@ def test_propose_revert_pr_title_uses_original_subject(tmp_path):
 
 
 def test_propose_revert_unknown_sha_fails_cleanly(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
 
     proc = run_cli("propose-revert", "0" * 40, "--repo", str(station), home=tmp_path)
 
@@ -148,7 +148,7 @@ def test_propose_revert_conflict_exits_2_and_leaves_no_branch(tmp_path):
 
 
 def test_propose_revert_reason_file_embedded_as_fenced_data(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     (station / "app.txt").write_text("v2\n")
     git(station, "commit", "-am", "landed change")
     git(station, "push", "origin", "main")
@@ -209,7 +209,7 @@ def write_fake_gh_pr_create(tmp_path: Path) -> Path:
 
 
 def test_propose_revert_gh_stub_uses_draft(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     (station / "app.txt").write_text("v2\n")
     git(station, "commit", "-am", "landed change")
     git(station, "push", "origin", "main")
@@ -251,7 +251,7 @@ def test_propose_revert_refuses_when_train_lock_held(tmp_path):
     # pid file on disk means nothing to it).
     from merge_train import _acquire_lock, _release_lock
 
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     (station / "app.txt").write_text("v2 - the landed change\n")
     git(station, "commit", "-am", "landed change to revert")
     git(station, "push", "origin", "main")

@@ -95,7 +95,7 @@ def test_red_branch_never_touches_main(tmp_path):
 
 
 def test_red_does_not_block_the_next_green(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     results = run_train(
         repo=station,
         branches=["claude/bad", "claude/good"],
@@ -108,7 +108,7 @@ def test_red_does_not_block_the_next_green(tmp_path):
 
 
 def test_tree_cache_skips_revalidation(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     counter = tmp_path / "count"
     gate = ["/bin/sh", "-c", f"echo x >> {counter}; exit 0"]
     run_train(repo=station, branches=["claude/good"], gate=gate)
@@ -119,7 +119,7 @@ def test_tree_cache_skips_revalidation(tmp_path):
 
 
 def test_textual_conflict_is_rejected_without_gate(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     seed = tmp_path / "seed"
     git(seed, "checkout", "main")
     (seed / "app.txt").write_text("main moved\n")
@@ -167,7 +167,7 @@ def test_run_train_migrates_legacy_directory_lock(tmp_path):
     # before this fix must not break on the very first run afterward -
     # _acquire_lock clears it out of the way and proceeds as a normal
     # fresh acquire.
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     lock = station / ".train" / "lock"
     lock.mkdir(parents=True)
     (lock / "pid").write_text("99999999")
@@ -176,7 +176,7 @@ def test_run_train_migrates_legacy_directory_lock(tmp_path):
 
 
 def test_live_lock_refuses(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     from merge_train import _acquire_lock, _release_lock
 
     lock = _acquire_lock(station)
@@ -418,7 +418,7 @@ def test_lock_true_concurrency(tmp_path):
 
 
 def test_missing_gate_binary_is_error_and_queue_continues(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     results = run_train(
         repo=station,
         branches=["claude/bad", "claude/good"],
@@ -431,7 +431,7 @@ def test_missing_gate_binary_is_error_and_queue_continues(tmp_path):
 
 
 def test_ghost_branch_reports_error(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     results = run_train(repo=station, branches=["claude/ghost"], gate=["/usr/bin/true"])
     assert results[0].status == "error"
     assert "not found" in results[0].detail
@@ -473,7 +473,7 @@ def test_cache_key_argv_boundaries():
 
 
 def test_corrupt_cache_quarantined_then_selfheals(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     train_dir = station / ".train"
     train_dir.mkdir(parents=True, exist_ok=True)
     cache_file = train_dir / "validated_trees.txt"
@@ -724,7 +724,7 @@ def test_pr_squash_tree_mismatch_is_loud_error(tmp_path, monkeypatch):
     # main moved between the local test and the real landing): point the
     # stub at the WRONG branch, so what actually lands on origin/main cannot
     # match the tree process_branch validated for "claude/good".
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     fake_gh = write_fake_gh(tmp_path)
     monkeypatch.setenv("SWITCHYARD_GH", str(fake_gh))
     monkeypatch.setenv("FAKE_GH_PR_NUMBER", "1")
@@ -837,7 +837,7 @@ def test_pr_squash_required_status_check_mentioning_head_is_rejected_not_requeue
 
 
 def test_cli_dry_run_red_exits_1(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     cli = [sys.executable, str(MERGE_TRAIN_SCRIPT), "run", "--repo", str(station)]
 
     dry_run = subprocess.run(
@@ -887,7 +887,7 @@ def test_run_without_repo_is_a_clear_error(tmp_path):
 
 
 def test_run_refuses_dirty_non_station_repo(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     (station / "app.txt").write_text("uncommitted local change\n")
 
     proc = subprocess.run(
@@ -1228,7 +1228,7 @@ def test_train_respects_config_gate_fast_and_batch_via_switchyard_toml(tmp_path)
 
 
 def test_history_appends_line_on_green_land(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     results = run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"])
     assert results[0].status == "landed"
 
@@ -1246,7 +1246,7 @@ def test_history_appends_line_on_green_land(tmp_path):
 
 
 def test_history_cache_hit_records_zero_gate_seconds(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     gate = ["/usr/bin/true"]
     run_train(repo=station, branches=["claude/good"], gate=gate)
     # Re-run the identical already-landed branch against the same gate: the
@@ -1263,7 +1263,7 @@ def test_history_cache_hit_records_zero_gate_seconds(tmp_path):
 
 
 def test_corrupt_history_dir_does_not_affect_results(tmp_path, capsys):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     train_dir = station / ".train"
     train_dir.mkdir(parents=True, exist_ok=True)
     # history.jsonl exists as a directory, not a file: open(..., "a") must
@@ -1288,7 +1288,7 @@ def test_corrupt_history_dir_does_not_affect_results(tmp_path, capsys):
 
 
 def test_retry_flaky_rescues_a_failing_gate_and_logs_it(tmp_path, capsys):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     counter = tmp_path / "count"
     # Fails the first time it is ever invoked (counter file does not exist
     # yet), passes every time after - a one-off flake, not a reproducible
@@ -1343,7 +1343,7 @@ def test_no_retry_flaky_cli_flag_runs_gate_only_once(tmp_path):
     # retry_flaky is only ever reached through main()/config or an explicit
     # run_train(retry_flaky=True) - this drives the real CLI to prove
     # --no-retry-flaky actually overrides a config that turns it on.
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     counter = tmp_path / "count"
     gate_script = tmp_path / "gate.sh"
     gate_script.write_text(f"#!/bin/sh\necho x >> {counter}\nexit 1\n")
@@ -1376,7 +1376,7 @@ def test_no_retry_flaky_cli_flag_runs_gate_only_once(tmp_path):
 
 
 def test_timeout_is_never_retried_even_with_retry_flaky_on(tmp_path):
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     counter = tmp_path / "count"
     gate = ["/bin/sh", "-c", f"echo x >> {counter}; sleep 3"]
 
@@ -1504,7 +1504,7 @@ def test_run_train_notifies_on_landed_and_rejected(tmp_path, monkeypatch):
         lambda title, message, cfg: calls.append((title, message, cfg.notify)),
     )
 
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     run_train(
         repo=station,
         branches=["claude/bad", "claude/good"],
@@ -1531,7 +1531,7 @@ def test_run_train_notifies_on_error(tmp_path, monkeypatch):
         merge_train, "_send_notification", lambda title, message, cfg: calls.append(title)
     )
 
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     run_train(repo=station, branches=["claude/ghost"], gate=["/usr/bin/true"], notify_mode="macos")
 
     assert len(calls) == 1
@@ -1546,7 +1546,7 @@ def test_run_train_does_not_notify_on_conflict(tmp_path, monkeypatch):
         merge_train, "_send_notification", lambda title, message, cfg: calls.append(title)
     )
 
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     seed = tmp_path / "seed"
     git(seed, "checkout", "main")
     (seed / "app.txt").write_text("main moved\n")
@@ -1572,7 +1572,7 @@ def test_run_train_flaky_landed_gets_a_distinct_notification(tmp_path, monkeypat
         lambda title, message, cfg: calls.append(title + " " + message),
     )
 
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     counter = tmp_path / "count"
     gate = [
         "/bin/sh",
@@ -1604,7 +1604,7 @@ def test_default_notify_mode_is_none(tmp_path, monkeypatch):
         merge_train, "_send_notification", lambda title, message, cfg: calls.append(cfg.notify)
     )
 
-    origin, station = make_world(tmp_path)
+    _origin, station = make_world(tmp_path)
     run_train(repo=station, branches=["claude/good"], gate=["/usr/bin/true"])
 
     assert calls == ["none"]

@@ -107,7 +107,7 @@ def test_track_new_creates_branch_and_worktree_with_gh_fallback(tmp_path):
 
 
 def test_track_new_errors_clearly_when_worktree_dir_unset(tmp_path):
-    origin, repo = make_world(tmp_path)
+    _origin, repo = make_world(tmp_path)
     # No switchyard.toml at all: cfg.worktree_dir defaults to "".
 
     proc = run_cli("track", "new", "no-config", "--repo", str(repo), home=tmp_path)
@@ -188,7 +188,7 @@ def test_track_done_dry_run_leaves_everything(tmp_path):
 def test_track_done_without_force_local_requires_merged_pr(tmp_path):
     # No --force-local and no gh on PATH: must refuse rather than silently
     # trust an unverified branch, and must not touch anything.
-    origin, repo = make_world(tmp_path)
+    _origin, repo = make_world(tmp_path)
     worktree_root = tmp_path / "worktrees"
     write_config(repo, worktree_root)
     new = run_cli("track", "new", "unverified", "--repo", str(repo), home=tmp_path)
@@ -206,7 +206,7 @@ def test_track_new_and_done_survive_a_full_round_trip(tmp_path):
     # Not one of the four explicitly-required scenarios, but cheap insurance
     # that new -> done composes cleanly end to end with a name containing a
     # timestamp-like suffix, closer to how a real session would name a track.
-    origin, repo = make_world(tmp_path)
+    _origin, repo = make_world(tmp_path)
     worktree_root = tmp_path / "worktrees"
     write_config(repo, worktree_root, branch_prefix="claude/")
     name = f"round-trip-{int(time.time())}"
@@ -232,7 +232,7 @@ def test_track_done_refuses_when_train_lock_held(tmp_path):
     # now; a hand-written pid file on disk means nothing to it).
     from merge_train import _acquire_lock, _release_lock
 
-    origin, repo = make_world(tmp_path)
+    _origin, repo = make_world(tmp_path)
     worktree_root = tmp_path / "worktrees"
     write_config(repo, worktree_root)
     new = run_cli("track", "new", "locked-out", "--repo", str(repo), home=tmp_path)

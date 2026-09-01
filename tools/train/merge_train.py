@@ -281,7 +281,9 @@ def _acquire_lock(repo: Path) -> TextIO:
         # process, only the flock acquired below matters for correctness.
         shutil.rmtree(lock_path, ignore_errors=True)
 
-    f = open(lock_path, "a+")
+    # Handle must outlive this function: run_train holds it across its whole
+    # try/finally, and a `with` block here would close it (dropping the flock).
+    f = open(lock_path, "a+")  # noqa: SIM115
     try:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
