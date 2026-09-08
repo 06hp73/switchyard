@@ -108,7 +108,7 @@ def main() -> int:
     else:
         print(f"RADAR: {len(results)} pairs replayed, {len(conflicts)} on collision course.")
         for r in conflicts:
-            print(f"  {r['a']} x {r['b']}: {', '.join(r['files'])}")
+            print(f"  {r['a']} x {r['b']} would conflict in: {', '.join(r['files'])}")
     return 1 if (conflicts and args.fail_on_conflict) else 0
 
 
