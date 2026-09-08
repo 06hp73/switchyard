@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "radar"))
 
-from collision_radar import live_branches, scan
+from collision_radar import live_branches, main as radar_main, scan
 
 
 def git(repo: Path, *args: str) -> None:
@@ -112,3 +112,20 @@ def test_live_branches_custom_prefixes(tmp_path):
     assert "release/x" in live_branches(repo, prefixes=("release/",))
     # A custom prefix set also EXCLUDES branches the default would include.
     assert "claude/a" not in live_branches(repo, prefixes=("release/",))
+
+
+def test_conflict_line_names_the_files_as_conflicts(tmp_path, capsys, monkeypatch):
+    """The printed line must say the files conflict, not merely name them.
+
+    Without the word, "branch-a x branch-b: <files>" reads as "files branch-a
+    touches", which is not what the radar computed: the list is git's own
+    conflict set for merging the pair, and a branch can appear against files it
+    never edited because it carries main's newer version of them.
+    """
+    repo = make_repo(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["collision_radar", "--repo", str(repo)])
+    radar_main()
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "claude/a x claude/b" in ln)
+    assert "would conflict in:" in line
+    assert "shared.txt" in line
