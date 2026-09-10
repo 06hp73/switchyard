@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import statistics
 import subprocess
@@ -772,6 +773,159 @@ def _watch_plist_xml(data: dict) -> str:
     return plistlib.dumps(data, fmt=plistlib.FMT_XML).decode("utf-8")
 
 
+# --- switchyard track sweep: close every track whose work already landed ------
+#
+# The reason this exists: `track done` has to be remembered, and it is not. A
+# track's worktree and branches sit there after its PR merges, the WIP count
+# climbs, and the collision radar fills with pairs that are only conflicting
+# because both sides are dead. Sweeping them is safe -- `track done` refuses
+# without a MERGED PR and git refuses a dirty worktree -- with exactly one
+# thing left to get wrong: removing a worktree somebody is still sitting in.
+
+
+#: Where Claude Code records one file per running session. Each carries the
+#: session's pid and its working directory, which is the only reliable way to
+#: know that a worktree is still open in front of somebody rather than merely
+#: left behind.
+_CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+
+
+def _live_session_cwds() -> set[Path] | None:
+    """Working directories of every Claude Code session running right now.
+
+    ``None`` means the question could not be answered -- the directory is
+    missing, unreadable, or holds nothing usable. That is NOT the same as "no
+    session is open", and :func:`cmd_track_sweep` treats the two differently on
+    purpose: with no evidence about what is open, the safe move is to sweep
+    nothing at all rather than to assume everything is closed and pull a
+    worktree out from under a session mid-command.
+
+    A record whose pid is no longer alive is ignored, so a session that crashed
+    without cleaning up after itself cannot pin its worktree open forever.
+    """
+    try:
+        records = sorted(_CLAUDE_SESSIONS_DIR.glob("*.json"))
+    except OSError:
+        return None
+    if not records:
+        return None
+
+    cwds: set[Path] = set()
+    seen_any = False
+    for record in records:
+        try:
+            data = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        pid, cwd = data.get("pid"), data.get("cwd")
+        if not isinstance(pid, int) or not isinstance(cwd, str) or not cwd:
+            continue
+        seen_any = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue  # the session is gone; its record is just litter
+        except PermissionError:
+            pass  # alive, owned by somebody else -- still alive, still counts
+        except OSError:
+            continue
+        try:
+            cwds.add(Path(cwd).resolve())
+        except OSError:
+            continue
+    return cwds if seen_any else None
+
+
+def _is_open_in_a_session(worktree: Path, live_cwds: set[Path]) -> bool:
+    """Whether *worktree* holds, or sits inside, a running session's directory.
+
+    Both directions are checked. A session started in the worktree root is the
+    ordinary case; a session started in a subdirectory of it is the same
+    situation one level down, and removing the worktree would break it just as
+    thoroughly.
+    """
+    try:
+        resolved = worktree.resolve()
+    except OSError:
+        return True  # cannot tell where it is; treat it as occupied
+    for cwd in live_cwds:
+        if cwd == resolved or resolved in cwd.parents or cwd in resolved.parents:
+            return True
+    return False
+
+
+def cmd_track_sweep(args: argparse.Namespace) -> int:
+    """Run ``track done`` for every landed track nobody is standing in.
+
+    Each candidate still goes through :func:`cmd_track_done` in full, so every
+    guard that command carries applies to every branch this one touches: the
+    MERGED-PR check via gh, the train's lock, and git's own refusal to remove a
+    worktree with local modifications or untracked files. This command adds one
+    guard of its own -- the open-session check -- and otherwise decides only
+    WHICH tracks to offer up.
+    """
+    repo = args.repo.resolve()
+    cfg = load_config(repo)
+    prefix = cfg.branch_prefix
+
+    live_cwds = _live_session_cwds()
+    if live_cwds is not None:
+        # Whoever invoked this is standing somewhere, and that somewhere is off
+        # limits no matter what the session list says. At session start there is
+        # a window where the session's own record is not written yet, and
+        # without this line a sweep launched from a landed worktree could remove
+        # the ground under the very session that started it.
+        try:
+            live_cwds.add(Path.cwd().resolve())
+        except OSError:
+            pass
+    if live_cwds is None:
+        print(
+            "switchyard track sweep: could not read the running-session list at "
+            f"{_CLAUDE_SESSIONS_DIR} - sweeping nothing. Not knowing which worktrees "
+            "are open is a reason to leave them alone, not a reason to assume they "
+            "are closed."
+        )
+        return 0
+
+    branches = subprocess.run(
+        ["git", "-C", str(repo), "for-each-ref", "refs/heads", "--format=%(refname:short)"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if branches.returncode != 0:
+        print(f"switchyard track sweep: could not list branches: {branches.stderr.strip()}")
+        return 2
+
+    candidates = [b for b in branches.stdout.split() if b.startswith(prefix) and b != prefix]
+    swept, skipped, refused = 0, 0, 0
+    for branch in sorted(candidates):
+        name = branch[len(prefix) :]
+        worktree = _find_worktree_for_branch(repo, branch)
+        if worktree is None and cfg.worktree_dir:
+            worktree = Path(cfg.worktree_dir).expanduser() / name
+        if worktree is not None and _is_open_in_a_session(Path(worktree), live_cwds):
+            print(f"  skip {name}: a session is open in its worktree")
+            skipped += 1
+            continue
+
+        done_args = argparse.Namespace(
+            name=name, repo=repo, force_local=False, dry_run=args.dry_run
+        )
+        if cmd_track_done(done_args) == 0:
+            swept += 1
+        else:
+            refused += 1
+
+    verb = "would sweep" if args.dry_run else "swept"
+    print(
+        f"switchyard track sweep: {verb} {swept}, skipped {skipped} open in a session, "
+        f"{refused} left alone (not merged, dirty, or the train was busy)"
+    )
+    return 0
+
+
 def cmd_watch_install(args: argparse.Namespace) -> int:
     repo = args.repo.resolve()
     cfg = load_config(repo)
@@ -1102,6 +1256,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="print what would happen, change nothing"
     )
     p_track_done.set_defaults(func=cmd_track_done)
+
+    p_track_sweep = track_sub.add_parser(
+        "sweep",
+        help="run `track done` for every landed track no running session is sitting in",
+    )
+    p_track_sweep.add_argument("--repo", type=Path, default=Path.cwd())
+    p_track_sweep.add_argument(
+        "--dry-run", action="store_true", help="print what would happen, change nothing"
+    )
+    p_track_sweep.set_defaults(func=cmd_track_sweep)
 
     p_watch = sub.add_parser(
         "watch", help="opt-in launchd periodic `switchyard land` (macOS only, off by default)"

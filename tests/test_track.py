@@ -6,6 +6,8 @@ still create the branch + worktree and push it, and `track done` needs
 `--force-local` to skip the "PR is MERGED" check gh would otherwise perform.
 """
 
+import json
+import os
 import shlex
 import subprocess
 import sys
@@ -370,3 +372,128 @@ def test_track_done_refuses_when_train_lock_held(tmp_path):
     # Refused before anything was touched.
     assert wt_path.is_dir()
     assert git(repo, "rev-parse", "--verify", "claude/locked-out")
+
+
+# --- switchyard track sweep ------------------------------
+#
+# The sweep decides only WHICH tracks to hand to `track done`; everything it
+# hands over still goes through that command's own guards. So these tests cover
+# the one judgement the sweep adds and nothing else: is somebody still sitting
+# in this worktree?
+
+
+def write_session_record(home: Path, pid: int, cwd: Path) -> Path:
+    """One Claude Code session record, the shape the sweep reads liveness from."""
+    sessions = home / ".claude" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    record = sessions / f"{pid}.json"
+    record.write_text(json.dumps({"pid": pid, "cwd": str(cwd), "kind": "interactive"}))
+    return record
+
+
+def a_dead_pid() -> int:
+    """A pid that has certainly exited and been reaped."""
+    proc = subprocess.Popen(["/usr/bin/true"])
+    proc.wait()
+    return proc.pid
+
+
+def land_a_track(tmp_path: Path, name: str) -> tuple[Path, Path, Path]:
+    """A track whose PR a stubbed gh reports as MERGED. Returns (repo, worktree, gh)."""
+    _origin, repo = make_world(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    write_config(repo, worktree_root)
+    new = run_cli("track", "new", name, "--repo", str(repo), home=tmp_path)
+    assert new.returncode == 0, new.stderr
+    return repo, worktree_root / name, write_stub_gh(tmp_path, 0, stdout="7")
+
+
+def test_sweep_closes_a_landed_track_nobody_is_sitting_in(tmp_path):
+    repo, wt_path, gh = land_a_track(tmp_path, "landed")
+    write_session_record(tmp_path, os.getpid(), tmp_path / "somewhere-else")
+
+    out = run_cli(
+        "track", "sweep", "--repo", str(repo), home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(gh)},
+    )
+
+    assert out.returncode == 0, out.stderr
+    assert not wt_path.is_dir(), out.stdout
+    assert not git_ok(repo, "rev-parse", "--verify", "claude/landed")
+
+
+def test_sweep_leaves_a_track_whose_worktree_has_a_session_open(tmp_path):
+    repo, wt_path, gh = land_a_track(tmp_path, "occupied")
+    # This test's own pid is alive by definition, which is the point: the record
+    # names a RUNNING session, sitting in exactly this worktree.
+    write_session_record(tmp_path, os.getpid(), wt_path)
+
+    out = run_cli(
+        "track", "sweep", "--repo", str(repo), home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(gh)},
+    )
+
+    assert out.returncode == 0, out.stderr
+    assert "a session is open" in out.stdout
+    assert wt_path.is_dir(), "a worktree with a live session in it was removed"
+    assert git_ok(repo, "rev-parse", "--verify", "claude/occupied")
+
+
+def test_sweep_ignores_a_record_whose_session_has_died(tmp_path):
+    """A crashed session leaves its record behind. Left uncheckd, that record
+    would pin its worktree open forever and the sweep would slowly stop
+    sweeping anything at all."""
+    repo, wt_path, gh = land_a_track(tmp_path, "crashed")
+    write_session_record(tmp_path, a_dead_pid(), wt_path)
+    write_session_record(tmp_path, os.getpid(), tmp_path / "somewhere-else")
+
+    out = run_cli(
+        "track", "sweep", "--repo", str(repo), home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(gh)},
+    )
+
+    assert out.returncode == 0, out.stderr
+    assert not wt_path.is_dir(), out.stdout
+
+
+def test_sweep_does_nothing_at_all_when_the_session_list_is_unreadable(tmp_path):
+    """No evidence about what is open is a reason to leave everything alone,
+    never a reason to assume everything is closed. FAILS if the empty case is
+    ever treated as "no session is running"."""
+    repo, wt_path, gh = land_a_track(tmp_path, "unknowable")
+    # tmp_path has no .claude/sessions at all.
+
+    out = run_cli(
+        "track", "sweep", "--repo", str(repo), home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(gh)},
+    )
+
+    assert out.returncode == 0, out.stderr
+    assert "sweeping nothing" in out.stdout
+    assert wt_path.is_dir()
+    assert git_ok(repo, "rev-parse", "--verify", "claude/unknowable")
+
+
+def test_sweep_never_removes_the_worktree_it_is_run_from(tmp_path):
+    """The session-start race: a sweep launched from a worktree can run before
+    that session's own record exists. FAILS if the sweep trusts the record list
+    alone and pulls the ground out from under its own caller."""
+    repo, wt_path, gh = land_a_track(tmp_path, "selfhosted")
+    # A record for some OTHER live session, so the list is readable and the
+    # sweep is armed -- but nothing in it names this worktree.
+    write_session_record(tmp_path, os.getpid(), tmp_path / "somewhere-else")
+
+    out = subprocess.run(
+        [sys.executable, str(CLI_SCRIPT), "track", "sweep", "--repo", str(repo)],
+        capture_output=True,
+        text=True,
+        env={**ENV, "HOME": str(tmp_path), "SWITCHYARD_GH": str(gh)},
+        cwd=wt_path,
+        timeout=30,
+        check=False,
+    )
+
+    assert out.returncode == 0, out.stderr
+    assert "a session is open" in out.stdout
+    assert wt_path.is_dir(), "the sweep removed the directory it was running in"
+
