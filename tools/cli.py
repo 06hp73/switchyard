@@ -837,19 +837,24 @@ def _live_session_cwds() -> set[Path] | None:
 
 
 def _is_open_in_a_session(worktree: Path, live_cwds: set[Path]) -> bool:
-    """Whether *worktree* holds, or sits inside, a running session's directory.
+    """Whether a running session's directory is *worktree* or lies inside it.
 
-    Both directions are checked. A session started in the worktree root is the
-    ordinary case; a session started in a subdirectory of it is the same
-    situation one level down, and removing the worktree would break it just as
-    thoroughly.
+    A session started in the worktree root is the ordinary case; a session
+    started in a subdirectory of it is the same situation one level down, and
+    removing the worktree would break it just as thoroughly.
+
+    A session in a directory ABOVE the worktree does not count. Track worktrees
+    commonly live inside the main checkout, and a session is commonly open
+    there; removing a worktree below it leaves that session's directory intact.
+    Counting ancestors pinned every track open whenever such a session ran, and
+    the sweep then closed nothing at all.
     """
     try:
         resolved = worktree.resolve()
     except OSError:
         return True  # cannot tell where it is; treat it as occupied
     for cwd in live_cwds:
-        if cwd == resolved or resolved in cwd.parents or cwd in resolved.parents:
+        if cwd == resolved or resolved in cwd.parents:
             return True
     return False
 

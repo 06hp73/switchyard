@@ -413,7 +413,11 @@ def test_sweep_closes_a_landed_track_nobody_is_sitting_in(tmp_path):
     write_session_record(tmp_path, os.getpid(), tmp_path / "somewhere-else")
 
     out = run_cli(
-        "track", "sweep", "--repo", str(repo), home=tmp_path,
+        "track",
+        "sweep",
+        "--repo",
+        str(repo),
+        home=tmp_path,
         extra_env={"SWITCHYARD_GH": str(gh)},
     )
 
@@ -429,7 +433,11 @@ def test_sweep_leaves_a_track_whose_worktree_has_a_session_open(tmp_path):
     write_session_record(tmp_path, os.getpid(), wt_path)
 
     out = run_cli(
-        "track", "sweep", "--repo", str(repo), home=tmp_path,
+        "track",
+        "sweep",
+        "--repo",
+        str(repo),
+        home=tmp_path,
         extra_env={"SWITCHYARD_GH": str(gh)},
     )
 
@@ -437,6 +445,47 @@ def test_sweep_leaves_a_track_whose_worktree_has_a_session_open(tmp_path):
     assert "a session is open" in out.stdout
     assert wt_path.is_dir(), "a worktree with a live session in it was removed"
     assert git_ok(repo, "rev-parse", "--verify", "claude/occupied")
+
+
+def test_sweep_is_not_blocked_by_a_session_in_a_directory_above_the_worktree(tmp_path):
+    """Track worktrees commonly live inside the main checkout, and a session is
+    commonly open in that checkout. Standing ABOVE a worktree is not standing in
+    it: removing the worktree leaves that session's directory intact. FAILS if
+    the check matches ancestors, which pins every track open at once."""
+    repo, wt_path, gh = land_a_track(tmp_path, "below")
+    write_session_record(tmp_path, os.getpid(), wt_path.parent.parent)
+
+    out = run_cli(
+        "track",
+        "sweep",
+        "--repo",
+        str(repo),
+        home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(gh)},
+    )
+
+    assert out.returncode == 0, out.stderr
+    assert "a session is open" not in out.stdout
+    assert not wt_path.is_dir(), out.stdout
+    assert not git_ok(repo, "rev-parse", "--verify", "claude/below")
+
+
+def test_sweep_leaves_a_track_whose_worktree_has_a_session_in_a_subdirectory(tmp_path):
+    repo, wt_path, gh = land_a_track(tmp_path, "nested")
+    write_session_record(tmp_path, os.getpid(), wt_path / "src")
+
+    out = run_cli(
+        "track",
+        "sweep",
+        "--repo",
+        str(repo),
+        home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(gh)},
+    )
+
+    assert out.returncode == 0, out.stderr
+    assert "a session is open" in out.stdout
+    assert wt_path.is_dir(), "a worktree with a live session below its root was removed"
 
 
 def test_sweep_ignores_a_record_whose_session_has_died(tmp_path):
@@ -448,7 +497,11 @@ def test_sweep_ignores_a_record_whose_session_has_died(tmp_path):
     write_session_record(tmp_path, os.getpid(), tmp_path / "somewhere-else")
 
     out = run_cli(
-        "track", "sweep", "--repo", str(repo), home=tmp_path,
+        "track",
+        "sweep",
+        "--repo",
+        str(repo),
+        home=tmp_path,
         extra_env={"SWITCHYARD_GH": str(gh)},
     )
 
@@ -464,7 +517,11 @@ def test_sweep_does_nothing_at_all_when_the_session_list_is_unreadable(tmp_path)
     # tmp_path has no .claude/sessions at all.
 
     out = run_cli(
-        "track", "sweep", "--repo", str(repo), home=tmp_path,
+        "track",
+        "sweep",
+        "--repo",
+        str(repo),
+        home=tmp_path,
         extra_env={"SWITCHYARD_GH": str(gh)},
     )
 
@@ -496,4 +553,3 @@ def test_sweep_never_removes_the_worktree_it_is_run_from(tmp_path):
     assert out.returncode == 0, out.stderr
     assert "a session is open" in out.stdout
     assert wt_path.is_dir(), "the sweep removed the directory it was running in"
-
