@@ -597,6 +597,86 @@ def cmd_track_new(args: argparse.Namespace) -> int:
     return 0
 
 
+def _branch_carries_nothing(repo: Path, branch: str, protected: str, gh: str) -> str | None:
+    """None when `branch` holds nothing a cleanup could lose; else why it might.
+
+    The second way a track is finished: it never got a PR and never got a commit
+    of its own (a session that only looked around, or whose work landed through
+    another branch). Such a branch never reaches the MERGED-PR check, so without
+    this it stays live forever and counts against the WIP cap. Nothing to lose
+    means all three: no open PR, the local tip already inside the fresh
+    origin/<protected>, and the remote copy (if any) inside it too. A brand-new
+    track is never caught here: `track new` seeds a commit and opens a draft PR.
+    Any check that cannot be made is a reason to keep the branch.
+    """
+    try:
+        open_prs = subprocess.run(
+            [
+                gh,
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "number",
+                "--limit",
+                "1",
+                "-q",
+                ".[0].number",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=repo,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"its open PRs could not be checked ({exc})"
+    open_number = open_prs.stdout.strip()
+    if open_prs.returncode != 0:
+        return "its open PRs could not be checked"
+    if open_number and open_number != "null":
+        return f"PR #{open_number} is still open"
+
+    fetch = subprocess.run(
+        ["git", "-C", str(repo), "fetch", "--quiet", "origin", protected],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if fetch.returncode != 0:
+        return f"origin/{protected} could not be fetched"
+    base = f"refs/remotes/origin/{protected}"
+
+    def inside_base(rev: str) -> bool:
+        return (
+            subprocess.run(
+                ["git", "-C", str(repo), "merge-base", "--is-ancestor", rev, base],
+                capture_output=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+
+    if not inside_base(f"refs/heads/{branch}"):
+        return f"it has commits not on origin/{protected}"
+
+    remote = subprocess.run(
+        ["git", "-C", str(repo), "ls-remote", "--heads", "origin", branch],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if remote.returncode != 0:
+        return "its remote copy could not be checked"
+    remote_sha = remote.stdout.split()[0] if remote.stdout.strip() else ""
+    if remote_sha and not inside_base(remote_sha):
+        return f"its remote copy has commits not on origin/{protected}"
+    return None
+
+
 def cmd_track_done(args: argparse.Namespace) -> int:
     repo = args.repo.resolve()
     cfg = load_config(repo)
@@ -637,12 +717,25 @@ def cmd_track_done(args: argparse.Namespace) -> int:
             )
             return 2
         merged_number = pr_list.stdout.strip()
-        if pr_list.returncode != 0 or not merged_number or merged_number == "null":
+        if pr_list.returncode != 0:
             print(
                 f"switchyard track done: no MERGED PR found for {branch} - refusing to clean up "
                 "(pass --force-local to skip this check if you are certain)"
             )
             return 2
+        if not merged_number or merged_number == "null":
+            empty_reason = _branch_carries_nothing(repo, branch, cfg.protected_branch, gh)
+            if empty_reason is not None:
+                print(
+                    f"switchyard track done: no MERGED PR found for {branch} and {empty_reason} "
+                    "- refusing to clean up (pass --force-local to skip this check if you are "
+                    "certain)"
+                )
+                return 2
+            print(
+                f"switchyard track done: {branch} has no PR and no commits beyond "
+                f"origin/{cfg.protected_branch} - nothing to lose, cleaning up"
+            )
 
     worktree_path = _find_worktree_for_branch(repo, branch)
     if worktree_path is None and cfg.worktree_dir:
