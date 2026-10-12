@@ -553,3 +553,115 @@ def test_sweep_never_removes_the_worktree_it_is_run_from(tmp_path):
     assert out.returncode == 0, out.stderr
     assert "a session is open" in out.stdout
     assert wt_path.is_dir(), "the sweep removed the directory it was running in"
+
+
+# --- track done / sweep: a track that never got a PR and holds nothing --------
+
+
+def write_pr_state_gh(tmp_path: Path, open_number: str = "") -> Path:
+    """A gh that knows no MERGED PR and reports `open_number` for an open one."""
+    stub = tmp_path / "pr-state-gh"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'state=""\n'
+        "while [ $# -gt 0 ]; do\n"
+        '  case "$1" in\n'
+        '    --state) state="$2"; shift 2;;\n'
+        "    *) shift;;\n"
+        "  esac\n"
+        "done\n"
+        f'if [ "$state" = open ]; then printf %s {shlex.quote(open_number)}; fi\n'
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def an_empty_track(tmp_path: Path, name: str, push: bool = True) -> tuple[Path, Path, Path]:
+    """A worktree on a branch at main with no commits of its own (a session that
+    only looked around). Returns (origin, repo, worktree)."""
+    origin, repo = make_world(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    write_config(repo, worktree_root)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "config")
+    git(repo, "push", "origin", "main")
+    wt_path = worktree_root / name
+    git(repo, "worktree", "add", "-b", f"claude/{name}", str(wt_path), "main")
+    if push:
+        git(repo, "push", "origin", f"claude/{name}")
+    return origin, repo, wt_path
+
+
+def sweep(repo: Path, tmp_path: Path, gh: Path) -> subprocess.CompletedProcess:
+    write_session_record(tmp_path, os.getpid(), tmp_path / "somewhere-else")
+    return run_cli(
+        "track",
+        "sweep",
+        "--repo",
+        str(repo),
+        home=tmp_path,
+        extra_env={"SWITCHYARD_GH": str(gh)},
+    )
+
+
+def test_sweep_closes_a_track_with_no_pr_and_no_commits_of_its_own(tmp_path):
+    origin, repo, wt_path = an_empty_track(tmp_path, "looked-around")
+
+    out = sweep(repo, tmp_path, write_pr_state_gh(tmp_path))
+
+    assert out.returncode == 0, out.stderr
+    assert "nothing to lose" in out.stdout, out.stdout
+    assert not wt_path.is_dir(), out.stdout
+    assert not git_ok(repo, "rev-parse", "--verify", "claude/looked-around")
+    assert not git_ok(origin, "rev-parse", "--verify", "claude/looked-around")
+
+
+def test_sweep_keeps_a_track_with_no_pr_but_a_commit_of_its_own(tmp_path):
+    origin, repo, wt_path = an_empty_track(tmp_path, "unsent-work")
+    (wt_path / "app.txt").write_text("v2\n")
+    git(wt_path, "commit", "-am", "work nobody opened a PR for")
+
+    out = sweep(repo, tmp_path, write_pr_state_gh(tmp_path))
+
+    assert "has commits not on origin/main" in out.stdout, out.stdout
+    assert wt_path.is_dir()
+    assert git(repo, "rev-parse", "--verify", "claude/unsent-work")
+
+
+def test_sweep_keeps_an_empty_track_whose_remote_copy_has_commits(tmp_path):
+    origin, repo, wt_path = an_empty_track(tmp_path, "pushed-elsewhere")
+    other = tmp_path / "other-clone"
+    subprocess.run(
+        ["git", "clone", "-b", "claude/pushed-elsewhere", str(origin), str(other)],
+        check=True,
+        capture_output=True,
+        env=ENV,
+    )
+    (other / "app.txt").write_text("v3\n")
+    git(other, "commit", "-am", "pushed from another machine")
+    git(other, "push", "origin", "claude/pushed-elsewhere")
+
+    out = sweep(repo, tmp_path, write_pr_state_gh(tmp_path))
+
+    assert "remote copy has commits" in out.stdout, out.stdout
+    assert wt_path.is_dir()
+    assert git_ok(origin, "rev-parse", "--verify", "claude/pushed-elsewhere")
+
+
+def test_sweep_keeps_an_empty_track_with_an_open_pr(tmp_path):
+    _origin, repo, wt_path = an_empty_track(tmp_path, "draft-open")
+
+    out = sweep(repo, tmp_path, write_pr_state_gh(tmp_path, open_number="12"))
+
+    assert "PR #12 is still open" in out.stdout, out.stdout
+    assert wt_path.is_dir()
+    assert git(repo, "rev-parse", "--verify", "claude/draft-open")
+
+
+def test_sweep_keeps_an_empty_track_when_gh_fails(tmp_path):
+    _origin, repo, wt_path = an_empty_track(tmp_path, "gh-down")
+
+    out = sweep(repo, tmp_path, write_stub_gh(tmp_path, 1, stderr="network down"))
+
+    assert wt_path.is_dir(), out.stdout
+    assert git(repo, "rev-parse", "--verify", "claude/gh-down")
